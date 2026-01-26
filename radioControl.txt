@@ -1,0 +1,32 @@
+{"BFOFrequency":0,"IFFilter":2750,"RITFrequency":8000,"Emission":"LINK11","Frequenncy":8556699,"Radio":"REDIFON","RevAGC":"FAST","RevMute":"","RevRFGain":0,"RevSquelch":0,"Type":"RECEIVE","XmtKeying":0,"XmtMode":0,"XmtPower":100,"XmtThreshold":0,"XmtUnkeyDelay":0,"XmtVOX":0,"objectName":"UpdateParam","settingKeys":"RADIO0"}
+
+<select name="mode" id="redmode1"> 
+<option value="ISB">ISB</option> 
+<option value="AM">AM</option> 
+<option value="CW">CW</option> 
+<option value="USB" selected="">USB</option> 
+<option value="LSB">LSB</option> 
+<option value="FSK">FSK</option> 
+<option value="SSB">SSB</option> 
+<option value="LINK11">LINK 11</option> 
+<option value="CENTEREDFSK">CENTERED FSK</option> 
+<option value="CENTEREDCW">CENTERED CW</option> 
+<option value="LINK11STANAG">LINK 11 STANAG</option> 
+<option value="MCW">MCW</option>
+</select>
+
+<input type="number" value="0" min="-7990" max="7990" step="1" id="bfo1">  BFO Freq (Hz)
+<input type="number" value="0" min="-2999" max="2999" step="1" id="rit1">  RIT Freq (Hz)
+
+<input type="number" value="0" min="-110" max="0" step="-1" id="redgain1">  RF Gain (dB)
+
+<select name="agc" id="redif1"> 
+<option value="300">300</option> 
+<option value="1100">1100</option> 
+<option value="2300" selected="">2300</option> 
+<option value="2400">2400</option> 
+<option value="2750">2750</option> 
+<option value="3100">3100</option> 
+<option value="5000">5000</option> 
+<option value="6000">6000</option></select>
+

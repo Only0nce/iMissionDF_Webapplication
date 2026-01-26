@@ -1,0 +1,9 @@
+*.o
+*.a
+*.so
+build/
+dist/
+*.log
+*.tmp
+*.swp
+.DS_Store
