@@ -174,7 +174,7 @@ include('ListAudioGain.php');
                                     Recorder Playback
                                 </a>
                             </li>                             
-                            <li class="nav-item">
+                            <!-- <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2 <?php if($currentScript=='eventLoggerData.php') echo 'active'; ?>"
                                    href="eventLoggerData.php">
                                     <svg class="bi">
@@ -182,7 +182,7 @@ include('ListAudioGain.php');
                                     </svg>
                                     Event Logger
                                 </a>
-                            </li>
+                            </li> -->
                             <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="audiofiles">
@@ -294,7 +294,9 @@ include('ListAudioGain.php');
                     <div class="row g-3">
                         <div class="col-md-2">
                             <label for="searchDevice" class="form-label text-white">Device</label>
-                            <input type="number" class="form-control" id="searchDevice" name="searchDevice" placeholder="Device ID">
+                            <select class="form-select" id="searchDevice" name="searchDevice">
+                                <option value="">Select Device</option>
+                            </select>
                         </div>
                         <div class="col-md-2">
                             <label for="searchFrequency" class="form-label text-white">Frequency (MHz)</label>

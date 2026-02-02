@@ -520,12 +520,12 @@ if ($deviceListQuery->num_rows > 0)
                         Recorder Playback
                     </a>
                 </li>                   
-                <li class="nav-item">
+                <!-- <li class="nav-item">
                   <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="eventLoggerData.php">
                     <svg class="bi"><use xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg?v=<?php echo time();?>#layer-group"/></svg>
                     Event Logger
                   </a>
-                </li>
+                </li> -->
                 <li class="nav-item">
                   <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="audiofiles">
                     <svg class="bi"><use xlink:href="fontawesome-free-5.15.4-web/sprites/regular.svg?v=<?php echo time();?>#file-audio"/></svg>

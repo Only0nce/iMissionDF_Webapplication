@@ -915,7 +915,7 @@ include('ListAudioGain.php');
                                     Recorder Playback
                                 </a>
                             </li>
-                            <li class="nav-item">
+                            <!-- <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="eventLoggerData.php">
                                     <svg class="bi">
@@ -924,7 +924,7 @@ include('ListAudioGain.php');
                                     </svg>
                                     Event Logger
                                 </a>
-                            </li>
+                            </li> -->
                             <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="audiofiles">
@@ -994,6 +994,7 @@ include('ListAudioGain.php');
                                     DF Device Settings
                                 </a>
                             </li>
+
                             <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" href="settings.php">
                                     <svg class="bi">

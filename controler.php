@@ -590,7 +590,7 @@ input[name="updatedAt"]:focus {
                                     Recorder Playback
                                 </a>
                             </li>
-                            <li class="nav-item">
+                            <!-- <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="eventLoggerData.php">
                                     <svg class="bi">
@@ -599,7 +599,7 @@ input[name="updatedAt"]:focus {
                                     </svg>
                                     Event Logger
                                 </a>
-                            </li>
+                            </li> -->
                             <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="audiofiles">

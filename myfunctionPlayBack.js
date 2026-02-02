@@ -7,6 +7,9 @@ let selectedFiles = [];
 let currentDevices = [];
 const maxDevices = 4;
 let deviceId = null;
+let pendingDeviceRecords = null;
+const autoMergeTimers = new Map();
+const AUTO_MERGE_DELAY_MS = 250;
 window.sendRecordSearch = sendRecordSearch;
 
 WebSocketTest();
@@ -50,9 +53,52 @@ function processMsg(message) {
         // renderRecordTable(obj.records);
         // renderRecordTable(obj.records, obj.device);
         renderRecordTable(obj.records, obj.device, obj.startDate, obj.endDate);
+    } else if (obj.menuID === "playRecordingDeviceStationResult") {
+        console.log("playRecordingDeviceStationResult:", obj);
+        // updateDeviceSelect(obj.records);
+        pendingDeviceRecords = obj.records || [];
+        updateDeviceSelect(pendingDeviceRecords);
     } 
     
 }
+
+function updateDeviceSelect(records) {
+    const select = document.getElementById("searchDevice");
+    if (!select) return;
+
+    const previousValue = select.value;
+    const devices = new Map();
+
+    (records || []).forEach((rec) => {
+        if (!rec || rec.id == null) return;
+        const id = String(rec.id);
+        if (!devices.has(id)) {
+            const name = rec.name ? String(rec.name) : "";
+            devices.set(id, name);
+        }
+    });
+
+    currentDevices = Array.from(devices.keys());
+
+    let optionsHtml = '<option value="">Select Device</option>';
+    devices.forEach((name, id) => {
+        const label = name ? `${id} - ${name}` : id;
+        optionsHtml += `<option value="${id}">${label}</option>`;
+    });
+
+    select.innerHTML = optionsHtml;
+
+    if (previousValue && devices.has(previousValue)) {
+        select.value = previousValue;
+    } else if (!previousValue && devices.size === 1) {
+        select.value = currentDevices[0];
+    }
+}
+document.addEventListener("DOMContentLoaded", function () {
+    if (pendingDeviceRecords && pendingDeviceRecords.length) {
+        updateDeviceSelect(pendingDeviceRecords);
+    }
+});
 
 function sendRecordSearch() {
     // var name = $("#searchName").val().trim();
@@ -102,15 +148,66 @@ if (ws.readyState === 1) {
 function makeGroupKey(deviceId, startDate, endDate) {
   const s = String(startDate || "");
   const e = String(endDate || "");
-  // ทำให้ปลอดภัยสำหรับ id
   return `${deviceId}_${s}_${e}`.replace(/[^a-zA-Z0-9_]/g, "_");
+}
+function clearMergedPreview(deviceGroupId) {
+  const div = document.getElementById(`mergedWaveform-${deviceGroupId}`);
+  if (div) {
+    div.innerHTML = "";
+  }
+
+  const overlay = document.getElementById(`waveRegionsOverlay-${deviceGroupId}`);
+  if (overlay) {
+    overlay.innerHTML = "";
+  }
+
+  const audioElem = document.getElementById(`mergedAudioPlayer-${deviceGroupId}`);
+  if (audioElem) {
+    audioElem.remove();
+  }
+
+  const durContainer = document.getElementById(`mergedDurations-${deviceGroupId}`);
+  if (durContainer) {
+    durContainer.innerHTML = "";
+  }
+
+  const title = document.getElementById(`previewTitle-${deviceGroupId}`);
+  if (title) {
+    const defaultTitle = title.getAttribute("data-default-title") || "Merged Audio Preview";
+    title.innerHTML = `<em>${defaultTitle}</em>`;
+  }
+}
+function clearSelectedRecords(deviceGroupId) {
+  const container = document.querySelector(`#device-group-${deviceGroupId}`);
+  if (!container) return;
+
+  container.querySelectorAll(".record-checkbox").forEach((chk) => {
+    chk.checked = false;
+  });
+
+  const selectAll = document.getElementById(`selectAll-${deviceGroupId}`);
+  if (selectAll) {
+    selectAll.checked = false;
+  }
+
+  clearMergedPreview(deviceGroupId);
+}
+function scheduleAutoMerge(groupKey) {
+  if (!groupKey) return;
+  const key = String(groupKey);
+  if (autoMergeTimers.has(key)) {
+    clearTimeout(autoMergeTimers.get(key));
+  }
+  autoMergeTimers.set(key, setTimeout(() => {
+    autoMergeTimers.delete(key);
+    applySelectedRecords(key, { silent: true });
+  }, AUTO_MERGE_DELAY_MS));
 }
 
 function renderRecordTable(records, deviceId, startDate, endDate) {
   const groupKey = makeGroupKey(deviceId, startDate, endDate);
   const container = document.getElementById("resultArea");
 
-  // ✅ ถ้ามีของเดิมแล้ว -> ลบทิ้งก่อน แล้วค่อยใส่ใหม่ (replace)
   const old = document.getElementById(`device-group-${groupKey}`);
   if (old) old.remove();
 
@@ -163,7 +260,7 @@ function renderRecordTable(records, deviceId, startDate, endDate) {
       </table>
 
       <div class="mt-5 p-3 border border-secondary rounded">
-        <h5 id="previewTitle-${groupKey}">
+        <h5 id="previewTitle-${groupKey}" data-default-title="Merged Audio Preview (Device ${deviceId})">
           <em>Merged Audio Preview (Device ${deviceId})</em>
         </h5>
 
@@ -184,6 +281,12 @@ function renderRecordTable(records, deviceId, startDate, endDate) {
             Merge Data
           </button>
 
+          <button id="clearFiles-${groupKey}"
+                  class="btn btn-secondary"
+                  onclick="clearSelectedRecords('${groupKey}')">
+            Clear Selection
+          </button>
+
           <button id="closeFiles-${groupKey}"
                   class="btn btn-primary"
                   onclick="closeFiles('${groupKey}')">
@@ -202,7 +305,18 @@ function renderRecordTable(records, deviceId, startDate, endDate) {
     const checked = this.checked;
     document.querySelectorAll(`.record-checkbox[data-device-group="${groupKey}"]`)
       .forEach(chk => chk.checked = checked);
+    scheduleAutoMerge(groupKey);
   });
+
+  const groupContainer = document.getElementById(`device-group-${groupKey}`);
+  if (groupContainer) {
+    groupContainer.addEventListener("change", (event) => {
+      const target = event.target;
+      if (target && target.classList && target.classList.contains("record-checkbox")) {
+        scheduleAutoMerge(groupKey);
+      }
+    });
+  }
 }
 
 // function renderRecordTable(records, deviceId, startDate, endDate) {
@@ -362,8 +476,9 @@ function formatDuration(secondsStr) {
 
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`;
 }
-function applySelectedRecords(deviceGroupId) {
+function applySelectedRecords(deviceGroupId, options) {
   console.log("🟡 เริ่ม applySelectedRecords → deviceGroupId =", deviceGroupId);
+  const opts = options || {};
 
   const selected = [];
   const container = document.querySelector(`#device-group-${deviceGroupId}`);
@@ -377,7 +492,10 @@ function applySelectedRecords(deviceGroupId) {
   const checkboxes = container.querySelectorAll(".record-checkbox:checked");
 
   if (checkboxes.length === 0) {
-    alert("Please select at least one file.");
+    if (!opts.silent) {
+      alert("Please select at least one file.");
+    }
+    clearMergedPreview(deviceGroupId);
     return;
   }
 
@@ -444,8 +562,9 @@ function applySelectedRecords(deviceGroupId) {
     generateConcatenatedWaveform(selected, deviceGroupId);
   });
 }
-function applySelectedRecords(deviceGroupId) {
+function applySelectedRecords(deviceGroupId, options) {
   console.log("🟡 เริ่ม applySelectedRecords → deviceGroupId =", deviceGroupId);
+  const opts = options || {};
 
   const selected = [];
   const container = document.querySelector(`#device-group-${deviceGroupId}`);
@@ -459,11 +578,32 @@ function applySelectedRecords(deviceGroupId) {
   const checkboxes = container.querySelectorAll(".record-checkbox:checked");
 
   if (checkboxes.length === 0) {
-    alert("Please select at least one file.");
+    if (!opts.silent) {
+      alert("Please select at least one file.");
+    }
+    clearMergedPreview(deviceGroupId);
     return;
   }
 
   let deviceId = null;
+
+  const parseCreatedAt = (value) => {
+    if (!value) return 0;
+    const ts = Date.parse(value);
+    if (!Number.isNaN(ts)) return ts;
+    const match = value.match(/(\d{1,2})\/(\d{1,2})\/(\d{4}),\s*(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)/i);
+    if (!match) return 0;
+    const month = parseInt(match[1], 10) - 1;
+    const day = parseInt(match[2], 10);
+    const year = parseInt(match[3], 10);
+    let hour = parseInt(match[4], 10);
+    const minute = parseInt(match[5], 10);
+    const second = parseInt(match[6], 10);
+    const ampm = match[7].toUpperCase();
+    if (ampm === "PM" && hour < 12) hour += 12;
+    if (ampm === "AM" && hour === 12) hour = 0;
+    return new Date(year, month, day, hour, minute, second).getTime();
+  };
 
 checkboxes.forEach((chk, i) => {
   const row = chk.closest("tr");
@@ -496,6 +636,8 @@ checkboxes.forEach((chk, i) => {
     name
   });
 });
+
+  selected.sort((a, b) => parseCreatedAt(a.createdAt) - parseCreatedAt(b.createdAt));
 
   console.log("✅ selected:", selected);
   console.log("✅ deviceId:", deviceId);
@@ -954,7 +1096,7 @@ function clearSearchForm() {
   console.log("🔄 Clear form...");
 
   // ล้างค่าฟิลด์
-  document.getElementById("searchDevice").value = "";
+  document.getElementById("searchDevice").selectedIndex = 0;
   document.getElementById("searchFrequency").value = "";
   document.getElementById("startDate").value = "";
   document.getElementById("intervalSelect").selectedIndex = 0;

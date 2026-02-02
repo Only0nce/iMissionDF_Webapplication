@@ -281,7 +281,7 @@ if (!empty($rolesList) && $roleID == -1) {
                         Recorder Playback
                     </a>
                 </li>
-                <li class="nav-item">
+                <!-- <li class="nav-item">
                   <a class="nav-link d-flex align-items-center gap-2"
                      href="eventLoggerData.php">
                     <svg class="bi">
@@ -289,7 +289,7 @@ if (!empty($rolesList) && $roleID == -1) {
                     </svg>
                     Event Logger
                   </a>
-                </li>
+                </li> -->
                 <li class="nav-item">
                   <a class="nav-link d-flex align-items-center gap-2"
                      href="audiofiles">
