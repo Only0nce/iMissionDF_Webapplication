@@ -1,3 +1,5 @@
+// dfdevice.js (FULL FILE)
+
 // ---------- WebSocket ----------
 var currentID = -1;
 var wsUri;
@@ -27,6 +29,7 @@ function showModalAlert(message) {
     alert(message);
   }
 }
+window.showModalAlert = showModalAlert;
 
 WebSocketTest();
 
@@ -45,7 +48,6 @@ function WebSocketTest() {
     };
 
     ws.onclose = function () {
-      // ใช้ ModalAlert แทน alert()
       showModalAlert("Unable to connect to the iScan Receiver Module.");
     };
   } else {
@@ -57,23 +59,20 @@ function WebSocketTest() {
 function processMsg(message) {
   try {
     var obj = JSON.parse(message);
-
-    if (!obj || !obj.menuID)
-      return;
+    if (!obj || !obj.menuID) return;
 
     if (obj.menuID === "currentRoleIdActive") {
-      // handle active role if needed
       return;
     }
 
-    // --- เพิ่มส่วนของ Scan Devices ---
-    if (obj.menuID === "scanDevicesFound") {
+    // --- Scan Devices (รองรับ 2 ชื่อ) ---
+    if (obj.menuID === "scanDeviceFound" || obj.menuID === "scanDevicesFound") {
       dfScan_handleDeviceFound(obj);
       return;
     }
 
     if (obj.menuID === "scanDevicesFinished") {
-      dfScan_handleScanFinished();
+      dfScan_handleScanFinished(obj);
       return;
     }
 
@@ -100,7 +99,6 @@ function applyDeviceFilter() {
     const idStr = card.id.replace("container", "");
     const devId = parseInt(idStr, 10);
 
-    // filter ตาม ID (dropdown)
     if (window.selectedDeviceId !== 0 && devId !== window.selectedDeviceId) {
       card.style.display = "none";
       return;
@@ -175,18 +173,9 @@ function insertClient() {
     const ipAddress  = ipAddressInput  ? ipAddressInput.value.trim()  : "";
     const deviceSN   = deviceSNInput   ? deviceSNInput.value.trim().toUpperCase() : "";
 
-    if (!deviceName) {
-      showModalAlert("Please enter Device Name.");
-      return;
-    }
-    if (!ipAddress) {
-      showModalAlert("Please enter IP Address.");
-      return;
-    }
-    if (!deviceSN) {
-      showModalAlert("Please enter Device Serial Number.");
-      return;
-    }
+    if (!deviceName) { showModalAlert("Please enter Device Name."); return; }
+    if (!ipAddress)  { showModalAlert("Please enter IP Address."); return; }
+    if (!deviceSN)   { showModalAlert("Please enter Device Serial Number."); return; }
 
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       showModalAlert("WebSocket is not connected.");
@@ -215,7 +204,7 @@ function insertClient() {
 }
 window.insertClient = insertClient;
 
-// ---------- Update Device (ปุ่ม Apply บนการ์ด) ----------
+// ---------- Update Device (Apply) ----------
 function setCurrentId(devId) {
   try {
     const nameInput = document.getElementById("devicename" + devId);
@@ -232,9 +221,9 @@ function setCurrentId(devId) {
       oldSnVal = attr ? attr.trim().toUpperCase() : "";
     }
 
-    if (!nameVal) { showModalAlert("Please enter Device Name.");   return; }
-    if (!ipVal)   { showModalAlert("Please enter IP Address.");    return; }
-    if (!newSnVal){ showModalAlert("Please enter Serial Number."); return; }
+    if (!nameVal)  { showModalAlert("Please enter Device Name.");   return; }
+    if (!ipVal)    { showModalAlert("Please enter IP Address.");    return; }
+    if (!newSnVal) { showModalAlert("Please enter Serial Number."); return; }
 
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       showModalAlert("WebSocket is not connected.");
@@ -259,13 +248,13 @@ function setCurrentId(devId) {
     }, 2000);
 
   } catch (e) {
-    console.error("setCurrentId (UpdateDevice) error:", e);
+    console.error("setCurrentId error:", e);
     showModalAlert("Error: " + e);
   }
 }
 window.setCurrentId = setCurrentId;
 
-// ---------- Delete Device (ปุ่ม Remove บนการ์ด) ----------
+// ---------- Delete Device (Remove) ----------
 function setCurrentIdForDelete(devId) {
   try {
     const nameInput = document.getElementById("devicename" + devId);
@@ -280,6 +269,7 @@ function setCurrentIdForDelete(devId) {
       showModalAlert("Serial Number not found, cannot delete.");
       return;
     }
+
     if (!confirm("Do you want to remove this device?\n" +
                  (nameVal ? ("Name: " + nameVal + "\n") : "") +
                  "SN: " + snVal)) {
@@ -319,10 +309,8 @@ window.setCurrentIdForDelete = setCurrentIdForDelete;
 // ====================  SCAN DEVICES (MODAL)  =========================
 // =====================================================================
 
-// ต้องมี existingDevices จาก PHP:
-//   var existingDevices = <?php echo json_encode($rowDeviceListQuery); ?>;
-// ใช้เช็คว่า IP/Name ซ้ำกับ DeviceList เดิมหรือไม่
-if (typeof existingDevices === 'undefined') {
+// ต้องมี existingDevices จาก PHP: var existingDevices = [...];
+if (typeof existingDevices === "undefined") {
   window.existingDevices = [];
 }
 
@@ -330,23 +318,31 @@ if (typeof existingDevices === 'undefined') {
 var dfScanList = [];   // {name, ip, serial, ping, selected, dupReason}
 
 function dfScan_isDupIp(ip) {
-  if (!Array.isArray(existingDevices))
-    return false;
+  if (!Array.isArray(existingDevices)) return false;
   for (var i = 0; i < existingDevices.length; i++) {
-    if (existingDevices[i].ipaddress === ip)
-      return true;
+    if ((existingDevices[i].ipaddress || "") === ip) return true;
   }
   return false;
 }
 
 function dfScan_isDupName(name) {
-  if (!Array.isArray(existingDevices))
-    return false;
+  if (!Array.isArray(existingDevices)) return false;
   for (var i = 0; i < existingDevices.length; i++) {
-    if (existingDevices[i].Name === name)
-      return true;
+    if ((existingDevices[i].Name || "") === name) return true;
   }
   return false;
+}
+
+function dfScan_isValidIPv4(ip) {
+  if (typeof ip !== "string") return false;
+  var p = ip.trim().split(".");
+  if (p.length !== 4) return false;
+  for (var i = 0; i < 4; i++) {
+    if (!/^\d+$/.test(p[i])) return false;
+    var n = Number(p[i]);
+    if (n < 0 || n > 255) return false;
+  }
+  return true;
 }
 
 // ----- Render ตารางใน modal -----
@@ -359,21 +355,13 @@ function dfScan_renderTable() {
   dfScanList.forEach(function (it, i) {
     var tr = document.createElement("tr");
 
-    // class สำหรับ hover + selected
     tr.className = "scan-row";
-    if (it.selected) {
-      tr.classList.add("scan-row-selected");
-    }
+    if (it.selected) tr.classList.add("scan-row-selected");
 
-    // เก็บ index ไว้บน tr
     tr.dataset.index = i.toString();
 
-    // คลิกทั้งแถว -> toggle เลือก
     tr.addEventListener("click", function (e) {
-      // ถ้าคลิกที่ checkbox เอง ปล่อยให้ event ของ checkbox จัดการ
-      if (e.target && e.target.type === "checkbox") {
-        return;
-      }
+      if (e.target && e.target.type === "checkbox") return;
       var idx = parseInt(this.dataset.index);
       if (!isNaN(idx)) {
         dfScanList[idx].selected = !dfScanList[idx].selected;
@@ -381,7 +369,7 @@ function dfScan_renderTable() {
       }
     });
 
-    // ===== checkbox =====
+    // checkbox
     var tdCheck = document.createElement("td");
     var chk = document.createElement("input");
     chk.type = "checkbox";
@@ -399,27 +387,27 @@ function dfScan_renderTable() {
     tdCheck.appendChild(chk);
     tr.appendChild(tdCheck);
 
-    // ===== name =====
+    // name
     var tdName = document.createElement("td");
     tdName.textContent = it.name || "";
     tr.appendChild(tdName);
 
-    // ===== ip =====
+    // ip
     var tdIp = document.createElement("td");
     tdIp.textContent = it.ip || "";
     tr.appendChild(tdIp);
 
-    // ===== serial =====
+    // serial
     var tdSerial = document.createElement("td");
     tdSerial.textContent = it.serial || "";
     tr.appendChild(tdSerial);
 
-    // ===== ping =====
+    // ping
     var tdPing = document.createElement("td");
     tdPing.textContent = (typeof it.ping === "number") ? (it.ping + " ms") : "";
     tr.appendChild(tdPing);
 
-    // ===== status =====
+    // status
     var tdStatus = document.createElement("td");
     if (it.dupReason) {
       tdStatus.textContent = it.dupReason;
@@ -436,7 +424,6 @@ function dfScan_renderTable() {
   dfScan_updateAddSelectedEnabled();
 }
 
-
 function dfScan_updateAddSelectedEnabled() {
   var btn = document.getElementById("btnAddSelectedScan");
   if (!btn) return;
@@ -448,13 +435,11 @@ function dfScan_updateAddSelectedEnabled() {
 }
 
 // ----- ปุ่มใน modal -----
-// เรียกจากปุ่ม "Scan" ใน modal
 function scanDevicesButtonClicked() {
   var btnScan = document.getElementById("btnScanDevices");
   var lblScan = document.getElementById("btnScanDevicesLabel");
 
-  if (btnScan && btnScan.disabled)
-    return;
+  if (btnScan && btnScan.disabled) return;
 
   dfScanList = [];
   dfScan_renderTable();
@@ -495,14 +480,11 @@ function dfScan_toggleAllFromHeader() {
   var master = document.getElementById("chkScanAll");
   if (!master) return;
 
-  // toggle check/uncheck
   master.checked = !master.checked;
-
-  // ใช้ฟังก์ชันที่มีอยู่แล้ว
   dfScan_toggleAllCheckbox(master);
 }
+window.dfScan_toggleAllFromHeader = dfScan_toggleAllFromHeader;
 
-// toggle master checkbox
 function dfScan_toggleAllCheckbox(masterCheckbox) {
   var checked = masterCheckbox.checked;
   dfScanList.forEach(function (it) {
@@ -512,7 +494,7 @@ function dfScan_toggleAllCheckbox(masterCheckbox) {
 }
 window.dfScan_toggleAllCheckbox = dfScan_toggleAllCheckbox;
 
-// Add Selected → ส่ง AddDevice ผ่าน WebSocket (ใช้ logic เดียวกับ insertClient)
+// Add Selected → ส่ง AddDevice ผ่าน WebSocket
 function dfScan_addSelected() {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showModalAlert("WebSocket is not connected.");
@@ -548,7 +530,7 @@ function dfScan_addSelected() {
 }
 window.dfScan_addSelected = dfScan_addSelected;
 
-// ----- ส่งคำขอสแกนไป backend -----
+// ----- ส่งคำขอสแกนไป backend (สำคัญ: menuID scanDevicesRange) -----
 function dfScan_sendScanRequest() {
   var btnScan = document.getElementById("btnScanDevices");
   var lblScan = document.getElementById("btnScanDevicesLabel");
@@ -563,39 +545,78 @@ function dfScan_sendScanRequest() {
     return;
   }
 
-  var payload = { objectName: "scanDevices" };
-  console.log("[dfdevice] send scanDevices:", payload);
+  var startEl = document.getElementById("scanStartIp");
+  var endEl   = document.getElementById("scanEndIp");
+
+  var startIp = startEl ? startEl.value.trim() : "";
+  var endIp   = endEl   ? endEl.value.trim()   : "";
+
+  if (!dfScan_isValidIPv4(startIp) || !dfScan_isValidIPv4(endIp)) {
+    showModalAlert("Invalid Start/End IP. Example: 192.168.10.1 - 192.168.10.254");
+    if (btnScan) { btnScan.disabled = false; btnScan.classList.remove("disabled"); }
+    if (lblScan) lblScan.textContent = "Scan";
+    return;
+  }
+
+  // ✅ ส่งไป C++ scanDevicesRange
+  var payload = {
+    menuID: "scanDevicesRange",
+    startIp: startIp,
+    endIp: endIp,
+    port: 9000,
+    timeoutMs: 200,
+    needAck: true
+  };
+
+  console.log("[dfdevice] send scanDevicesRange:", payload);
   ws.send(JSON.stringify(payload));
 }
 
 // ----- handler จาก backend: เจอ device 1 ตัว -----
 function dfScan_handleDeviceFound(msg) {
-  var name   = msg.name   || "";
-  var serial = msg.serial || "";
-  var ip     = msg.ip     || "";
-  var ping   = (typeof msg.ping === "number") ? msg.ping : null;
+  // รองรับ key หลายแบบ (เผื่อ backend ส่งต่าง)
+  var name   = msg.name   || msg.Name || "";
+  var ip     = msg.ip     || msg.IPAddress || msg.ipaddress || "";
+  var serial = msg.serial || msg.deviceUniqueId || msg.sn || "";
+  var ping   = (typeof msg.ping === "number") ? msg.ping :
+               (typeof msg.pingMs === "number") ? msg.pingMs : null;
+
+  if (!ip) return;
 
   var dupReason = null;
   if (dfScan_isDupIp(ip)) {
     dupReason = "Duplicate IP";
-  } else if (dfScan_isDupName(name)) {
+  } else if (name && dfScan_isDupName(name)) {
     dupReason = "Duplicate Name";
   }
 
-  dfScanList.push({
-    name:     name,
-    serial:   serial,
-    ip:       ip,
-    ping:     ping,
-    selected: false,
-    dupReason: dupReason
-  });
+  // ✅ ถ้ามี ip เดิมแล้ว update แทน push
+  var foundIndex = -1;
+  for (var i = 0; i < dfScanList.length; i++) {
+    if (dfScanList[i].ip === ip) { foundIndex = i; break; }
+  }
+
+  if (foundIndex >= 0) {
+    dfScanList[foundIndex].name = name;
+    dfScanList[foundIndex].serial = serial;
+    dfScanList[foundIndex].ping = ping;
+    dfScanList[foundIndex].dupReason = dupReason;
+  } else {
+    dfScanList.push({
+      name:      name,
+      serial:    serial,
+      ip:        ip,
+      ping:      ping,
+      selected:  false,
+      dupReason: dupReason
+    });
+  }
 
   dfScan_renderTable();
 }
 
 // ----- handler จาก backend: scanFinished -----
-function dfScan_handleScanFinished() {
+function dfScan_handleScanFinished(msg) {
   var btnScan = document.getElementById("btnScanDevices");
   var lblScan = document.getElementById("btnScanDevicesLabel");
 
@@ -605,5 +626,6 @@ function dfScan_handleScanFinished() {
   }
   if (lblScan) lblScan.textContent = "Scan";
 
-  showModalAlert("Scan complete.");
+  var count = (msg && typeof msg.count === "number") ? msg.count : dfScanList.length;
+  showModalAlert("Scan complete. Found " + count + " device(s).");
 }

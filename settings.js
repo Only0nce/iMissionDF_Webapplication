@@ -21,6 +21,9 @@ function WebSocketTest() {
       ws.send('{"menuID":"getVuMeter"}');
       ws.send('{"menuID":"getServerHomePage", "iGateNum":1}');
       ws.send('{"menuID":"getServerHomePage", "iGateNum":2}');
+      vpnInitRememberOvpn();
+      vpnStatus();
+      vpnRefreshPublicIp();
       // ws.send('{"menuID":"getServerHomePage", "iGateNum":3}');
       // ws.send('{"menuID":"getServerHomePage", "iGateNum":4}');
     };
@@ -106,6 +109,7 @@ function processMsg(message)
       return { ip, netmask };
     }
 
+    console.log("Network config object:", obj);
     function setLanUI(idx, lanObj) {
       if (!lanObj) return;
 
@@ -311,7 +315,9 @@ function processMsg(message)
     else if (st === "TEARDOWN" || st === "ERROR") el.style.color = "#e95921ff";
     else el.style.color = "#6c757d";
   }
-
+  else if (obj.menuID === "vpnControl") {
+  vpnHandleWsMessage(obj);
+  }
 
 }
 function setRecorderStatus(el, state) {
@@ -1011,6 +1017,254 @@ let iGate2Uri = iGate2UriEl.value;
     alert("Connection is closed...");
   }
 }
+
+/* ============================================================
+ * VPN (OpenVPN) addon for your existing structure
+ * - Remember selected .ovpn in localStorage (base64)
+ * - Apply:
+ *    1) if user selected file -> uploadOvpn
+ *    2) else if local cache -> uploadOvpn
+ *    3) else -> useRemembered (backend uses disk file)
+ * ============================================================ */
+
+const VPN_CACHE_KEY = "vpn_ovpn_cache_v1";
+
+function vpnLoadCache() {
+  try {
+    const raw = localStorage.getItem(VPN_CACHE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.filename || !obj.content_b64) return null;
+    return obj;
+  } catch (e) {
+    return null;
+  }
+}
+
+function vpnSaveCache(filename, content_b64) {
+  try {
+    localStorage.setItem(VPN_CACHE_KEY, JSON.stringify({
+      filename,
+      content_b64,
+      saved_at: Date.now()
+    }));
+  } catch (e) {}
+}
+
+function vpnClearRemembered() {
+  try { localStorage.removeItem(VPN_CACHE_KEY); } catch (e) {}
+  vpnUpdateRememberedUi();
+  ModalCustomAlert("Cleared remembered .ovpn (browser cache)");
+}
+
+function vpnUpdateRememberedUi() {
+  const el = document.getElementById("vpn_config_remember");
+  if (!el) return;
+
+  const cache = vpnLoadCache();
+  if (cache) {
+    const dt = new Date(cache.saved_at || Date.now());
+    el.textContent = `${cache.filename} (saved ${dt.toLocaleString()})`;
+  } else {
+    el.textContent = "-";
+  }
+}
+
+// optional: show backend remembered file name
+function vpnUpdateBackendRememberedUi(filename) {
+  const el = document.getElementById("vpn_config_remember_backend");
+  if (!el) return;
+  el.textContent = filename && filename.length ? filename : "-";
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function vpnInitRememberOvpn() {
+  const fileInput = document.getElementById("vpn_config");
+  if (fileInput && !fileInput.__vpnHooked) {
+    fileInput.__vpnHooked = true;
+
+    fileInput.addEventListener("change", function () {
+      const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+      if (!file) {
+        vpnUpdateRememberedUi();
+        return;
+      }
+      if (!file.name.toLowerCase().endsWith(".ovpn")) {
+        ModalCustomAlert("Only .ovpn file allowed");
+        return;
+      }
+      if (file.size > 512 * 1024) {
+        ModalCustomAlert("File too large (max 512KB)");
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = function () {
+        const b64 = arrayBufferToBase64(reader.result);
+        vpnSaveCache(file.name, b64);
+        vpnUpdateRememberedUi();
+        ModalCustomAlert(`Remembered: ${file.name}`);
+      };
+      reader.onerror = function () {
+        ModalCustomAlert("Read file failed");
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  vpnUpdateRememberedUi();
+}
+
+function vpnSend(obj) {
+  if (!ws || ws.readyState !== 1) {
+    ModalCustomAlert("WebSocket not connected");
+    return false;
+  }
+  ws.send(JSON.stringify(obj));
+  
+  return true;
+}
+
+function vpnApply() {
+  const enableEl = document.getElementById("vpn_enable");
+  const enable = enableEl ? !!enableEl.checked : false;
+
+  if (!enable) {
+    vpnSend({ menuID: "vpnControl", action: "stop" });
+    return;
+  }
+
+  const fileInput = document.getElementById("vpn_config");
+  const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+
+  // 1) new file -> uploadOvpn
+  if (file) {
+    if (!file.name.toLowerCase().endsWith(".ovpn")) {
+      ModalCustomAlert("Only .ovpn file allowed");
+      return;
+    }
+    if (file.size > 512 * 1024) {
+      ModalCustomAlert("File too large (max 512KB)");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function () {
+      const b64 = arrayBufferToBase64(reader.result);
+
+      // remember in browser too
+      vpnSaveCache(file.name, b64);
+      vpnUpdateRememberedUi();
+
+      vpnSend({
+        menuID: "vpnControl",
+        action: "uploadOvpn",
+        filename: file.name,
+        content_b64: b64
+      });
+    };
+    reader.onerror = function () {
+      ModalCustomAlert("Read file failed");
+    };
+    reader.readAsArrayBuffer(file);
+    return;
+  }
+
+  // 2) no file -> use browser cache
+  const cache = vpnLoadCache();
+  if (cache) {
+    vpnSend({
+      menuID: "vpnControl",
+      action: "uploadOvpn",
+      filename: cache.filename,
+      content_b64: cache.content_b64
+    });
+    return;
+  }
+
+  // 3) no cache -> let backend use remembered disk file
+  vpnSend({
+    menuID: "vpnControl",
+    action: "useRemembered"
+  });
+}
+
+// ===== receive side (ใน processMsg) =====
+/*
+else if (obj.menuID === "vpnControl") {
+  vpnHandleWsMessage(obj);
+}
+*/
+
+
+function vpnDisconnect() {
+  vpnSend({ menuID: "vpnControl", action: "stop" });
+}
+
+function vpnStart() {
+  vpnSend({ menuID: "vpnControl", action: "start" });
+}
+
+function vpnStatus() {
+  vpnSend({ menuID: "vpnControl", action: "status" });
+}
+
+function vpnRefreshPublicIp() {
+  vpnSend({ menuID: "vpnControl", action: "publicip" });
+}
+
+function vpnHandleWsMessage(obj) {
+  const st = document.getElementById("vpn_status");
+  const ip = document.getElementById("vpn_public_ip");
+  const en = document.getElementById("vpn_enable");
+  const cfgLoaded = document.getElementById("vpn_config_loaded");
+
+  if (st) {
+    st.textContent = obj.active ? "CONNECTED" : "DISCONNECTED";
+    st.classList.toggle("text-danger", !obj.active);
+    st.classList.toggle("text-success", !!obj.active);
+  }
+
+  // ip might be input or span
+  if (ip) {
+    if ("value" in ip) ip.value = obj.public_ip || "--";
+    else ip.textContent = obj.public_ip || "--";
+  }
+
+  if (en) {
+    if (typeof obj.enabled === "boolean") en.checked = obj.enabled;
+    else if (typeof obj.active === "boolean") en.checked = obj.active;
+  }
+
+  // backend remembered file name
+  if (typeof obj.remembered_file !== "undefined") {
+    vpnUpdateBackendRememberedUi(obj.remembered_file);
+  }
+
+  // optional show currently used config
+  if (cfgLoaded) {
+    const v = obj.config_loaded || obj.remembered_file || "--";
+    if ("value" in cfgLoaded) cfgLoaded.value = v;
+    else cfgLoaded.textContent = v;
+  }
+
+  if (obj.ok === false) {
+    ModalCustomAlert(obj.detail || "VPN error");
+  }
+}
+
+
+// // WebSocket variables
+
 
 
 

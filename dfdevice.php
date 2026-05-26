@@ -3,6 +3,7 @@
   if($_SESSION['UserID'] == "")
   {
     echo("<script>location.href = 'login.php';</script>");
+    exit();
   }
   else{
     $userID = $_SESSION['UserID'];
@@ -15,6 +16,7 @@
   else
   {
     echo("<script>location.href = 'login.php';</script>");
+    exit();
   }
 
   if($_SESSION['userName'])
@@ -61,10 +63,14 @@ if ($deviceListQuery->num_rows > 0)
 
 // JSON สำหรับ dropdown "Devices"
 $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'UTF-8');
+
+// JSON สำหรับ existingDevices ให้ JS ใช้ตรวจซ้ำ (ไม่ต้อง htmlspecialchars เพราะจะใส่ใน <script> เป็น JS object)
+$existingDevicesJson = json_encode($rowDeviceListQuery, JSON_UNESCAPED_UNICODE);
 ?>
 <!doctype html>
 <html lang="en" data-bs-theme="auto">
-  <head><script src="assets/js/color-modes.js"></script>
+  <head>
+    <script src="assets/js/color-modes.js"></script>
 
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -149,44 +155,45 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
         font-size: 0.8rem;
         padding: 0.35rem 0.5rem;
       }
-      /* แถวปกติ */
+
+      /* Scan table rows */
       .scan-row {
-          cursor: pointer;
-          transition: background-color 0.15s ease, border-color 0.15s ease;
+        cursor: pointer;
+        transition: background-color 0.15s ease, border-color 0.15s ease;
       }
-
-      /* Hover effect */
       .scan-row:hover {
-          background-color: rgba(148, 163, 184, 0.10) !important;
+        background-color: rgba(148, 163, 184, 0.10) !important;
       }
-
-      /* แถวที่ถูกเลือก — ครอบทั้งหมด */
       .scan-row-selected,
       .scan-row-selected td,
       .scan-row-selected th {
-          background-color: rgba(59, 130, 246, 0.25) !important;
-          border-color: rgba(59, 130, 246, 0.45) !important;
+        background-color: rgba(59, 130, 246, 0.25) !important;
+        border-color: rgba(59, 130, 246, 0.45) !important;
       }
-
-      /* เมื่อเลือกแล้ว hover ก็ยังควรเห็นสีเดียว */
       .scan-row-selected:hover td {
-          background-color: rgba(59, 130, 246, 0.30) !important;
+        background-color: rgba(59, 130, 246, 0.30) !important;
       }
-
     </style>
 
     <script src="assets/dist/js/bootstrap.bundle.min.js"></script>
     <script src="dashboard.js"></script>
-    <script src="settings.js?v=<?php echo time(); ?>"></script>
+
+    <!-- ✅ inject existingDevices ให้ dfdevice.js ใช้ -->
+    <script>
+      // existingDevices จาก PHP: [{id,Name,ipaddress,deviceUniqueId}, ...]
+      var existingDevices = <?php echo $existingDevicesJson ? $existingDevicesJson : "[]"; ?>;
+    </script>
+
+    <!-- ✅ js หลักของหน้านี้ -->
     <script src="dfdevice.js?v=<?php echo time(); ?>"></script>
 
+    <!-- (ของเดิมคุณมี jQuery เยอะ) -->
     <script src="js/jquery.min.js"></script>
     <script type="text/javascript" src="js/jquery-latest.min.js"></script>
     <script type="text/javascript" src="js/jquery-ui.js"></script>
     <link rel="stylesheet" type="text/css" href="css/jquery.datetimepicker.css">
     <script type="text/javascript" src="js/jquery.js"></script>
     <script type="text/javascript" src="js/jquery.datetimepicker.js"></script>
-
   </head>
 
   <header class="navbar sticky-top flex-md-nowrap p-0 shadow" style="background-color:#000000DD;">
@@ -240,44 +247,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
       </ul>
     </div>
 
-    <!-- Modal confirmToRebootSystem-->
-    <div class="modal fade" id="confirmToRebootSystem" tabindex="-1" aria-labelledby="confirmToRebootSystemLabel" aria-hidden="true">
-      <div class="modal-dialog">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title" id="confirmToRebootSystemLabel">Please Confirm</h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-          </div>
-          <div class="modal-body">
-            System will be reboot. Please Confirm!
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn btn-primary" data-bs-dismiss="modal" >Close</button>
-            <button type="button" class="btn btn-danger" data-bs-dismiss="modal" onclick="confirmToRebootSystem()" >REBOOT</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal confirmToUpdateSystem-->
-    <div class="modal fade" id="confirmToUpdateSystem" tabindex="-1" aria-labelledby="confirmToUpdateSystemLabel" aria-hidden="true">
-      <div class="modal-dialog">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title" id="confirmToUpdateSystemLabel">Please Confirm</h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-          </div>
-          <div class="modal-body">
-            System will be update firmware. Please Confirm!
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn btn-primary" data-bs-dismiss="modal" >Close</button>
-            <button type="button" class="btn btn-danger" data-bs-dismiss="modal" onclick="systemupdate()" >UPDATE</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <!-- ✅ Single Reusable Alert Modal -->
     <div class="modal fade" id="ModalAlert" tabindex="-1" aria-labelledby="ModalAlertTitle" aria-hidden="true">
       <div class="modal-dialog">
@@ -287,8 +256,7 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body">
-            <!-- เปลี่ยนเป็น span เพื่อให้ JS แก้ข้อความได้ -->
-            <span id="ModalAlertBody">Unable to connect to the iScan Receiver Module.</span>
+            <span id="ModalAlertBody">Alert</span>
           </div>
           <div class="modal-footer">
             <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="ModalAlertCloseBtn">Close</button>
@@ -296,7 +264,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
         </div>
       </div>
     </div>
-    <!-- จบ: Single Alert Modal -->
 
     <!-- Modal New Device -->
     <div class="modal fade" id="ModalNewDevice" tabindex="-1" aria-labelledby="newdevice" aria-hidden="true" style="--bs-modal-width: 50%;">
@@ -355,9 +322,11 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
               </div>
             </div>
           </div>
+
         </div>
       </div>
     </div>
+
     <!-- Modal Scan Devices -->
     <div class="modal fade" id="ModalScanDevices" tabindex="-1" aria-labelledby="scanDevicesLabel" aria-hidden="true" style="--bs-modal-width: 70%;">
       <div class="modal-dialog modal-lg modal-dialog-scrollable">
@@ -372,13 +341,23 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
             <div class="container-fluid m-0 p-1" style="min-width: 100%;">
               <div class="card m-0 p-2" style="width: 100%; height: 100%;">
 
-                <!-- Header row: title + Scan button -->
                 <div class="row align-items-center mb-2">
                   <div class="col">
                     <h3 class="h5 mb-0">Network Scan</h3>
                     <small class="text-body-secondary">Scan subnet for iScan MR-10 / DF devices</small>
                   </div>
-                  <div class="col-auto d-flex gap-2">
+
+                  <!-- ✅ Start/End IP -->
+                  <div class="col-12 col-lg-auto mt-2 mt-lg-0">
+                    <div class="input-group input-group-sm">
+                      <span class="input-group-text">Start</span>
+                      <input id="scanStartIp" type="text" class="form-control" placeholder="192.168.10.1" value="192.168.10.1">
+                      <span class="input-group-text">End</span>
+                      <input id="scanEndIp" type="text" class="form-control" placeholder="192.168.10.254" value="192.168.10.254">
+                    </div>
+                  </div>
+
+                  <div class="col-auto d-flex gap-2 mt-2 mt-lg-0">
                     <button id="btnScanDevices"
                             type="button"
                             class="btn btn-sm btn-primary"
@@ -400,7 +379,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                   </div>
                 </div>
 
-                <!-- Table list -->
                 <div class="row">
                   <div class="col-12">
                     <div class="table-responsive" style="max-height: 350px; overflow-y: auto;">
@@ -423,18 +401,10 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                           </tr>
                         </thead>
                         <tbody id="scanTableBody">
-                          <!-- JS จะเติม <tr> มาตรงนี้ -->
+                          <!-- JS เติม -->
                         </tbody>
                       </table>
                     </div>
-                  </div>
-                </div>
-
-                <div class="row mt-2">
-                  <div class="col-12">
-                    <!-- <small class="text-body-secondary">
-                      Tip: เลือกรายการที่ต้องการ แล้วกด "Add Selected" เพื่อเพิ่มเข้า DeviceList.
-                    </small> -->
                   </div>
                 </div>
 
@@ -486,25 +456,20 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                         Recorder Playback
                     </a>
                 </li>
-                <!-- <li class="nav-item">
-                  <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="eventLoggerData.php">
-                    <svg class="bi"><use xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg?v=<?php echo time();?>#layer-group"/></svg>
-                    Event Logger
-                  </a>
-                </li> -->
                 <li class="nav-item">
                   <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="audiofiles">
                     <svg class="bi"><use xlink:href="fontawesome-free-5.15.4-web/sprites/regular.svg?v=<?php echo time();?>#file-audio"/></svg>
                     Audio Archive
                   </a>
                 </li>
-                <li class="nav-item">
+                <!---<li class="nav-item">
                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="mapvisual.php">
                     <svg class="bi"><use xlink:href="dashboard.svg?v=<?php echo time();?>#mapvisual"/></svg>
                     Map Visual
                 </a>
-                </li>    
+                </li>-->
               </ul>
+
               <hr class="my-3">
               <h6 class="sidebar-heading d-flex justify-content-between align-items-center px-3 mt-4 mb-1 text-body-secondary text-uppercase">
                 <span>Device Manager</span>
@@ -522,7 +487,7 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                         <svg class="bi">
                             <use xlink:href="dashboard.svg?v=<?php echo time();?>#picture" />
                         </svg>
-                        Picture 
+                        Picture
                     </a>
                 </li>
                 <li class="nav-item">
@@ -548,6 +513,14 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                     <svg class="bi"><use xlink:href="dashboard.svg#gear-wide-connected"/></svg>
                     Settings
                   </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link d-flex align-items-center gap-2" href="wifi.php">
+                        <svg class="bi">
+                            <use xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg#wifi" />
+                        </svg>
+                        Wi-Fi & LTE Settings
+                    </a>
                 </li>
                 <li class="nav-item">
                     <a class="nav-link d-flex align-items-center gap-2 <?php if($currentScript == 'controler.php') echo 'active'; ?>"
@@ -582,7 +555,7 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                       </button>
                     </div>';
 
-              // สร้าง dropdown filter จาก DeviceList
+              // dropdown filter
               echo '
                 <button id="deviceIdSelect" value="0" type="button"
                         class="btn btn-outline-secondary dropdown-toggle d-flex justify-content-between align-items-center gap-1 m-1"
@@ -593,7 +566,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                 <ul class="dropdown-menu">
               ';
 
-              // All Device
               echo '
                 <li class="dropdown-item" onclick="showOnly1ID(0,\'All Device\',\'puzzle\','.$devicesJson.')">
                   <a class="dropdown-link d-flex align-items-center gap-2">
@@ -603,7 +575,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                 </li>
               ';
 
-              // per device
               foreach ($rowDeviceListQuery as $rowDevice)
               {
                 $id   = (int)$rowDevice["id"];
@@ -626,14 +597,14 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                 echo 'New Device';
                 echo '  </button>';
               }
-                echo '<button type="button"
-                            class="btn btn-sm btn-outline-success d-flex align-items-center gap-1 m-1"
-                            data-bs-toggle="modal"
-                            data-bs-target="#ModalScanDevices">';
-                echo '    <svg class="bi"><use xlink:href="dashboard.svg#search"/></use></svg>';
-                echo 'Scan Devices';
-                echo '</button>';
 
+              echo '<button type="button"
+                          class="btn btn-sm btn-outline-success d-flex align-items-center gap-1 m-1"
+                          data-bs-toggle="modal"
+                          data-bs-target="#ModalScanDevices">';
+              echo '    <svg class="bi"><use xlink:href="dashboard.svg#search"/></use></svg>';
+              echo 'Scan Devices';
+              echo '</button>';
               ?>
             </div>
           </div>
@@ -645,7 +616,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
             else
               echo '<fieldset id="deviceControl" disabled style="opacity:1">';
 
-            // ใช้ row + col แบบ Bootstrap ปรับระยะห่างการ์ดให้สวย
             echo '<div class="row g-3">';
 
             foreach ($rowDeviceListQuery as $rowDevice)
@@ -659,7 +629,6 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
               echo '    <div class="card device-card h-100">';
               echo '      <div class="card-body">';
 
-              // Header: ชื่อ + badge serial
               echo '        <div class="device-card-header">';
               echo '          <h5 id="DeviceName'.$id.'" class="device-card-title">'.$name.'</h5>';
               if (!empty($uid)) {
@@ -669,19 +638,16 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
               }
               echo '        </div>';
 
-              // Device Name
               echo '        <div class="mb-2">';
               echo '          <div class="device-card-label">Device Name</div>';
               echo '          <input id="devicename'.$id.'" type="text" class="form-control" value="'.$name.'">';
               echo '        </div>';
 
-              // IP Address
               echo '        <div class="mb-2">';
               echo '          <div class="device-card-label">IP Address</div>';
               echo '          <input id="ipaddress'.$id.'" type="text" class="form-control" value="'.$ip.'">';
               echo '        </div>';
 
-              // Serial Number
               echo '        <div class="mb-3">';
               echo '          <div class="device-card-label">Serial Number</div>';
               echo '          <input id="deviceuniqueid'.$id.'" '
@@ -691,18 +657,17 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
                   .'data-original-sn="'.$uid.'">';
               echo '        </div>';
 
-              // ปุ่ม Apply / Remove
               echo '        <div class="device-card-actions d-flex gap-2">';
               echo '          <button type="button" class="btn btn-primary flex-fill" onclick="setCurrentId('.$id.')">Apply</button>';
               echo '          <button type="button" class="btn btn-warning flex-fill" onclick="setCurrentIdForDelete('.$id.')">Remove</button>';
               echo '        </div>';
 
-              echo '      </div>';  // card-body
-              echo '    </div>';    // card
-              echo '  </div>';      // col
+              echo '      </div>';
+              echo '    </div>';
+              echo '  </div>';
             }
 
-            echo '</div>'; // row
+            echo '</div>';
           }
           echo '</fieldset>';
           ?>
@@ -721,55 +686,26 @@ $devicesJson = htmlspecialchars(json_encode($rowDeviceListQuery), ENT_QUOTES, 'U
   }
 ?>
 
-<!-- ✅ JS helper สำหรับแสดง Alert Modal -->
+<!-- ✅ helper showModalAlert (modal ของหน้านี้) -->
 <script>
-  document.getElementById("ModalAlert").addEventListener("shown.bs.modal", function () {
-    const modals = document.querySelectorAll(".modal.show");
-    let topZ = 1050;
+function showModalAlert(message) {
+  try {
+    var bodySpan = document.getElementById("ModalAlertBody");
+    if (bodySpan) bodySpan.textContent = message;
 
-    modals.forEach(m => {
-        const z = parseInt(window.getComputedStyle(m).zIndex || 1050);
-        if (z > topZ) topZ = z;
-    });
-
-    this.style.zIndex = topZ + 10;
-    this.querySelector(".modal-dialog").style.zIndex = topZ + 11;
-});
-
-  function showAlert(message, title) {
-    if (title) {
-      document.getElementById('ModalAlertTitle').textContent = title;
+    var modalElement = document.getElementById("ModalAlert");
+    if (modalElement && typeof bootstrap !== "undefined") {
+      var modal = bootstrap.Modal.getOrCreateInstance(modalElement);
+      modal.show();
     } else {
-      document.getElementById('ModalAlertTitle').textContent = 'Alert';
+      alert(message);
     }
-
-    document.getElementById('ModalAlertBody').textContent = message;
-
-    var modalEl = document.getElementById('ModalAlert');
-    var modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-    modal.show();
+  } catch (e) {
+    console.error("showModalAlert error:", e);
+    alert(message);
   }
-
-  function showAlertAndReload(message, title) {
-    if (title) {
-      document.getElementById('ModalAlertTitle').textContent = title;
-    } else {
-      document.getElementById('ModalAlertTitle').textContent = 'Alert';
-    }
-
-    document.getElementById('ModalAlertBody').textContent = message;
-
-    var modalEl = document.getElementById('ModalAlert');
-
-    // ลบ event เดิมถ้ามี เพื่อไม่ให้ reload ซ้ำ
-    modalEl.addEventListener('hidden.bs.modal', function handler() {
-      modalEl.removeEventListener('hidden.bs.modal', handler);
-      location.reload();
-    });
-
-    var modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-    modal.show();
-  }
+}
+window.showModalAlert = showModalAlert;
 </script>
 
 </body>

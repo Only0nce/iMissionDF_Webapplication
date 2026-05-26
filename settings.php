@@ -269,7 +269,7 @@ include('ListVariable.php');
                                     Audio Archive
                                 </a>
                             </li>
-                            <li class="nav-item">
+                            <!-- <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="mapvisual.php">
                                     <svg class="bi">
@@ -277,7 +277,7 @@ include('ListVariable.php');
                                     </svg>
                                     Map Visual
                                 </a>
-                            </li>
+                            </li> -->
                         </ul>
                         <hr class="my-3">
                         <h6
@@ -329,6 +329,14 @@ include('ListVariable.php');
                                         <use xlink:href="dashboard.svg#gear-wide-connected" />
                                     </svg>
                                     Settings
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link d-flex align-items-center gap-2" href="wifi.php">
+                                    <svg class="bi">
+                                        <use xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg#wifi" />
+                                    </svg>
+                                    Wi-Fi & LTE Settings
                                 </a>
                             </li>
                             <li class="nav-item">
@@ -888,6 +896,62 @@ include('ListVariable.php');
         echo '    </div>';     // container
         echo '  </div>';       // card
         // ===== END Card =====
+        // ===== VPN Card (OpenVPN Only) =====
+        echo '  <div class="card m-1 p-1" style="min-width: 367px;">';
+        echo '    <div class="container m-0 p-2" style="width: 100%;height: 100%;">';
+
+        echo '      <div class="row m-0">';
+        echo '        <h5 class="p-0 pb-1 pt-1 mb-1 border-bottom">OpenVPN</h5>';
+        echo '      </div>';
+
+        // Status
+        echo '      <div class="mb-2 d-flex flex-column">';
+        echo '        <span class="small text-uppercase text-muted">VPN Status</span>';
+        echo '        <span id="vpn_status" class="fw-semibold text-danger">DISCONNECTED</span>';
+        echo '      </div>';
+
+        // Enable Switch (layout fix)
+        echo '      <div class="d-flex align-items-center justify-content-between mb-3">';
+        echo '        <label class="form-label mb-0">Enable VPN</label>';
+        echo '        <div class="form-check form-switch m-0">';
+        echo '          <input class="form-check-input m-0" type="checkbox" id="vpn_enable">';
+        echo '        </div>';
+        echo '      </div>';
+
+        // Config Upload
+        echo '      <div class="mb-3">';
+        echo '        <label class="form-label">OpenVPN Config (.ovpn)</label>';
+        echo '        <input id="vpn_config" type="file" class="form-control" accept=".ovpn">';
+        echo '      </div>';
+        echo '      <div class="mb-2">';
+        echo '        <div class="small text-muted">Remembered file:</div>';
+        echo '        <div id="vpn_config_remember" class="fw-semibold">-</div>';
+        echo '        <button type="button" class="btn btn-sm btn-outline-danger mt-2" onclick="vpnClearRemembered()">Clear remembered file</button>';
+        echo '      </div>';
+
+        // Public IP
+        echo '      <div class="mb-3">';
+        echo '        <label class="form-label">Public IP</label>';
+        echo '        <div class="input-group">';
+        echo '          <input id="vpn_public_ip" type="text" class="form-control text-center" disabled placeholder="--">';
+        echo '          <button class="btn btn-outline-secondary" type="button" onclick="vpnRefreshPublicIp()">Refresh</button>';
+        echo '        </div>';
+        echo '      </div>';
+
+        // Buttons
+        echo '      <div class="row g-2">';
+        echo '        <div class="col-6">';
+        echo '          <button type="button" class="btn btn-outline-secondary w-100" onclick="vpnDisconnect()">Disconnect</button>';
+        echo '        </div>';
+        echo '        <div class="col-6">';
+        echo '          <button type="button" class="btn btn-primary w-100" onclick="vpnApply()">Apply</button>';
+        echo '        </div>';
+        echo '      </div>';
+
+        echo '    </div>';
+        echo '  </div>';
+
+        // ===== END VPN Card =====
 
 
       echo '<div class="card m-1 p-1" style="min-width: 367px; display: none">

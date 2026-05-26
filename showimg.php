@@ -292,12 +292,12 @@ if ($baseReal2 && strpos($baseReal2, "/var/www/html/") === 0) {
                 Audio Archive
               </a>
             </li>
-            <li class="nav-item">
+            <!-- <li class="nav-item">
               <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="mapvisual.php">
                 <svg class="bi"><use xlink:href="dashboard.svg?v=<?php echo time();?>#mapvisual"/></svg>
                 Map Visual
               </a>
-            </li>
+            </li> -->
           </ul>
 
           <hr class="my-3">
@@ -341,6 +341,14 @@ if ($baseReal2 && strpos($baseReal2, "/var/www/html/") === 0) {
                 <svg class="bi"><use xlink:href="dashboard.svg#gear-wide-connected"/></svg>
                 Settings
               </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link d-flex align-items-center gap-2" href="wifi.php">
+                    <svg class="bi">
+                        <use xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg#wifi" />
+                    </svg>
+                    Wi-Fi & LTE Settings
+                </a>
             </li>
             <li class="nav-item">
               <a class="nav-link d-flex align-items-center gap-2" href="controler.php">
