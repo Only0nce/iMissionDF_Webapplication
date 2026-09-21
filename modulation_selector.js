@@ -110,7 +110,9 @@ function applyModSelection() {
       mod: selectedMode.text,                      // e.g. "wfm"
       low_cut: selectedBW.low,                     // e.g. -75000
       high_cut: selectedBW.high,                   // e.g. 75000
-      offset_freq: Math.round(offsetFrequency),    // current offset
+      // Phase G: tuning is owned exclusively by FrequencyController in
+      // webrx.js. Changing modulation/BW must never resend or overwrite RF
+      // offset state.
       squelch_level: squelchLevel || -150,         // current SQL
       dmr_filter: 3,                               // optional static/default
       audio_service_id: 0,                         // optional static/default

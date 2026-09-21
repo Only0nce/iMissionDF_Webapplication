@@ -587,24 +587,6 @@ function applySelectedRecords(deviceGroupId, options) {
 
   let deviceId = null;
 
-  const parseCreatedAt = (value) => {
-    if (!value) return 0;
-    const ts = Date.parse(value);
-    if (!Number.isNaN(ts)) return ts;
-    const match = value.match(/(\d{1,2})\/(\d{1,2})\/(\d{4}),\s*(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)/i);
-    if (!match) return 0;
-    const month = parseInt(match[1], 10) - 1;
-    const day = parseInt(match[2], 10);
-    const year = parseInt(match[3], 10);
-    let hour = parseInt(match[4], 10);
-    const minute = parseInt(match[5], 10);
-    const second = parseInt(match[6], 10);
-    const ampm = match[7].toUpperCase();
-    if (ampm === "PM" && hour < 12) hour += 12;
-    if (ampm === "AM" && hour === 12) hour = 0;
-    return new Date(year, month, day, hour, minute, second).getTime();
-  };
-
 checkboxes.forEach((chk, i) => {
   const row = chk.closest("tr");
   const filename = row.querySelector("td:nth-child(2)")?.textContent.trim();
@@ -636,8 +618,6 @@ checkboxes.forEach((chk, i) => {
     name
   });
 });
-
-  selected.sort((a, b) => parseCreatedAt(a.createdAt) - parseCreatedAt(b.createdAt));
 
   console.log("✅ selected:", selected);
   console.log("✅ deviceId:", deviceId);

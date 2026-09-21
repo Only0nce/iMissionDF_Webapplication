@@ -1,0 +1,1071 @@
+<?php
+declare(strict_types=1);
+
+
+/*
+ * PHP 7 compatibility.
+ * Ubuntu/Apache deployments may still run PHP < 8.0 where these helpers
+ * do not exist yet.
+ */
+if (!function_exists('str_contains')) {
+    function str_contains(string $haystack, string $needle): bool
+    {
+        return $needle === '' || strpos($haystack, $needle) !== false;
+    }
+}
+
+if (!function_exists('str_starts_with')) {
+    function str_starts_with(string $haystack, string $needle): bool
+    {
+        return $needle === '' || strncmp($haystack, $needle, strlen($needle)) === 0;
+    }
+}
+
+
+/*
+ * showaudio.php
+ * Audio Archive page using the same visual shell style as showimg.php.
+ *
+ * Target:
+ *   /var/www/html/showaudio.php
+ *
+ * Audio root:
+ *   /var/www/html/audiofiles
+ */
+
+session_start();
+
+$audioRoot = realpath(__DIR__ . '/audiofiles');
+$audioUrlBase = 'audiofiles';
+$allowedExt = [
+    'wav'  => true,
+    'mp3'  => true,
+    'ogg'  => true,
+    'flac' => true,
+    'm4a'  => true,
+];
+
+$perPageOptions = [12, 24, 48];
+$defaultPerPage = 12;
+
+function h(string $s): string
+{
+    return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function normalize_path(string $path): string
+{
+    return str_replace('\\', '/', $path);
+}
+
+function human_size(int $bytes): string
+{
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $size = (float)$bytes;
+    $i = 0;
+
+    while ($size >= 1024 && $i < count($units) - 1) {
+        $size /= 1024;
+        $i++;
+    }
+
+    return $i === 0
+        ? sprintf('%d B', (int)$size)
+        : sprintf('%.1f %s', $size, $units[$i]);
+}
+
+function safe_audio_realpath(?string $audioRoot, string $relative): ?string
+{
+    if ($audioRoot === false || $audioRoot === null) {
+        return null;
+    }
+
+    $relative = ltrim(normalize_path($relative), '/');
+    if ($relative === '' || str_contains($relative, '..')) {
+        return null;
+    }
+
+    $full = realpath($audioRoot . '/' . $relative);
+    if ($full === false) {
+        return null;
+    }
+
+    $rootNorm = rtrim(normalize_path($audioRoot), '/') . '/';
+    $fullNorm = normalize_path($full);
+
+    if (!str_starts_with($fullNorm, $rootNorm)) {
+        return null;
+    }
+
+    return $full;
+}
+
+function rel_url(string $relativePath): string
+{
+    $parts = explode('/', normalize_path($relativePath));
+    $parts = array_map('rawurlencode', $parts);
+    return implode('/', $parts);
+}
+
+function parse_audio_meta(string $relativePath, string $filename, int $mtime): array
+{
+    $pathParts = explode('/', normalize_path($relativePath));
+    $folder = count($pathParts) > 1 ? $pathParts[0] : 'Root';
+
+    $meta = [
+        'folder' => $folder,
+        'channel' => $folder,
+        'frequency' => '',
+        'dateKey' => '',
+        'dateLabel' => date('Y-m-d', $mtime),
+        'monthLabel' => date('Y-m', $mtime),
+        'yearLabel' => date('Y', $mtime),
+        'timeLabel' => date('H:i:s', $mtime),
+        'displayName' => $filename,
+        'sortTimestamp' => $mtime,
+    ];
+
+    /*
+     * Supported filename pattern:
+     *   41-44_19700101_082819_011344_121.100.wav
+     */
+    if (preg_match('/^(.+?)_(\d{8})_(\d{6})_(\d+)_([0-9]+(?:\.[0-9]+)?)\.[^.]+$/i', $filename, $m)) {
+        $channel = $m[1];
+        $dateKey = $m[2];
+        $timeKey = $m[3];
+        $freq = $m[5];
+
+        $year = substr($dateKey, 0, 4);
+        $month = substr($dateKey, 4, 2);
+        $day = substr($dateKey, 6, 2);
+
+        $hh = substr($timeKey, 0, 2);
+        $mm = substr($timeKey, 2, 2);
+        $ss = substr($timeKey, 4, 2);
+
+        $parsedTs = strtotime("$year-$month-$day $hh:$mm:$ss");
+
+        $meta['channel'] = $channel;
+        $meta['frequency'] = $freq . ' MHz';
+        $meta['dateKey'] = $dateKey;
+        $meta['dateLabel'] = "$year-$month-$day";
+        $meta['monthLabel'] = "$year-$month";
+        $meta['yearLabel'] = $year;
+        $meta['timeLabel'] = "$hh:$mm:$ss";
+        $meta['displayName'] = $freq . ' MHz';
+
+        /*
+         * If device timestamp is valid enough, use it. Otherwise keep mtime.
+         * This prevents obviously stale 1970 names from forcing all files old
+         * when Apache/file mtime carries the real recent order.
+         */
+        if ($parsedTs !== false && (int)$year >= 2000) {
+            $meta['sortTimestamp'] = $parsedTs;
+        }
+
+        return $meta;
+    }
+
+    foreach ($pathParts as $part) {
+        if (preg_match('/^\d{8}$/', $part)) {
+            $year = substr($part, 0, 4);
+            $month = substr($part, 4, 2);
+            $day = substr($part, 6, 2);
+
+            $meta['dateKey'] = $part;
+            $meta['dateLabel'] = "$year-$month-$day";
+            $meta['monthLabel'] = "$year-$month";
+            $meta['yearLabel'] = $year;
+            break;
+        }
+    }
+
+    if (preg_match('/([0-9]+(?:\.[0-9]+)?)\.(wav|mp3|ogg|flac|m4a)$/i', $filename, $m)) {
+        $meta['frequency'] = $m[1] . ' MHz';
+        $meta['displayName'] = $meta['frequency'];
+    }
+
+    return $meta;
+}
+
+function collect_audio_files(?string $audioRoot, string $audioUrlBase, array $allowedExt): array
+{
+    $items = [];
+
+    if ($audioRoot === false || $audioRoot === null || !is_dir($audioRoot)) {
+        return $items;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($audioRoot, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    foreach ($iterator as $fileInfo) {
+        if (!$fileInfo->isFile()) {
+            continue;
+        }
+
+        $ext = strtolower($fileInfo->getExtension());
+        if (!isset($allowedExt[$ext])) {
+            continue;
+        }
+
+        $full = $fileInfo->getRealPath();
+        if ($full === false) {
+            continue;
+        }
+
+        $rootNorm = rtrim(normalize_path($audioRoot), '/') . '/';
+        $fullNorm = normalize_path($full);
+
+        if (!str_starts_with($fullNorm, $rootNorm)) {
+            continue;
+        }
+
+        $relative = substr($fullNorm, strlen($rootNorm));
+        $filename = $fileInfo->getFilename();
+        $mtime = $fileInfo->getMTime();
+        $meta = parse_audio_meta($relative, $filename, $mtime);
+
+        $items[] = [
+            'name' => $filename,
+            'relative' => $relative,
+            'url' => $audioUrlBase . '/' . rel_url($relative),
+            'sizeBytes' => $fileInfo->getSize(),
+            'sizeLabel' => human_size($fileInfo->getSize()),
+            'mtime' => $mtime,
+            'mtimeLabel' => date('Y-m-d H:i:s', $mtime),
+            'folder' => $meta['folder'],
+            'channel' => $meta['channel'],
+            'frequency' => $meta['frequency'],
+            'dateKey' => $meta['dateKey'],
+            'dateLabel' => $meta['dateLabel'],
+            'monthLabel' => $meta['monthLabel'],
+            'yearLabel' => $meta['yearLabel'],
+            'timeLabel' => $meta['timeLabel'],
+            'displayName' => $meta['displayName'],
+            'sortTimestamp' => $meta['sortTimestamp'],
+        ];
+    }
+
+    return $items;
+}
+
+function csrf_token(): string
+{
+    if (empty($_SESSION['audio_csrf'])) {
+        $_SESSION['audio_csrf'] = bin2hex(random_bytes(16));
+    }
+
+    return $_SESSION['audio_csrf'];
+}
+
+function verify_csrf(): bool
+{
+    return isset($_POST['csrf'], $_SESSION['audio_csrf'])
+        && hash_equals($_SESSION['audio_csrf'], (string)$_POST['csrf']);
+}
+
+$flash = '';
+$flashType = 'info';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!verify_csrf()) {
+        $flash = 'Invalid request token.';
+        $flashType = 'danger';
+    } else {
+        $action = (string)($_POST['action'] ?? '');
+
+        if ($action === 'delete_one') {
+            $target = (string)($_POST['file'] ?? '');
+            $real = safe_audio_realpath($audioRoot, $target);
+
+            if ($real !== null && is_file($real)) {
+                unlink($real);
+                $flash = 'Deleted 1 audio file.';
+                $flashType = 'success';
+            } else {
+                $flash = 'File not found or unsafe path.';
+                $flashType = 'danger';
+            }
+        }
+
+        if ($action === 'delete_selected') {
+            $files = $_POST['files'] ?? [];
+            if (!is_array($files)) {
+                $files = [];
+            }
+
+            $deleted = 0;
+
+            foreach ($files as $relative) {
+                $real = safe_audio_realpath($audioRoot, (string)$relative);
+                if ($real !== null && is_file($real)) {
+                    unlink($real);
+                    $deleted++;
+                }
+            }
+
+            $flash = 'Deleted ' . $deleted . ' selected audio file(s).';
+            $flashType = $deleted > 0 ? 'success' : 'danger';
+        }
+    }
+}
+
+$q = trim((string)($_GET['q'] ?? ''));
+$date = trim((string)($_GET['date'] ?? ''));
+$month = trim((string)($_GET['month'] ?? ''));
+$year = trim((string)($_GET['year'] ?? ''));
+$page = max(1, (int)($_GET['page'] ?? 1));
+$perPage = (int)($_GET['per_page'] ?? $defaultPerPage);
+if (!in_array($perPage, $perPageOptions, true)) {
+    $perPage = $defaultPerPage;
+}
+
+$allItems = collect_audio_files($audioRoot, $audioUrlBase, $allowedExt);
+
+$years = [];
+foreach ($allItems as $item) {
+    if ($item['yearLabel'] !== '') {
+        $years[$item['yearLabel']] = true;
+    }
+}
+$years = array_keys($years);
+rsort($years, SORT_NATURAL);
+
+$filtered = array_values(array_filter($allItems, static function (array $item) use ($q, $date, $month, $year): bool {
+    if ($q !== '') {
+        $hay = strtolower(implode(' ', [
+            $item['name'],
+            $item['relative'],
+            $item['folder'],
+            $item['channel'],
+            $item['frequency'],
+            $item['dateLabel'],
+            $item['timeLabel'],
+        ]));
+
+        if (!str_contains($hay, strtolower($q))) {
+            return false;
+        }
+    }
+
+    if ($date !== '' && $item['dateLabel'] !== $date) {
+        return false;
+    }
+
+    if ($month !== '' && $item['monthLabel'] !== $month) {
+        return false;
+    }
+
+    if ($year !== '' && $item['yearLabel'] !== $year) {
+        return false;
+    }
+
+    return true;
+}));
+
+/*
+ * Always show latest first.
+ */
+usort($filtered, static function (array $a, array $b): int {
+    $cmp = $b['sortTimestamp'] <=> $a['sortTimestamp'];
+    if ($cmp !== 0) {
+        return $cmp;
+    }
+
+    $cmp = $b['mtime'] <=> $a['mtime'];
+    if ($cmp !== 0) {
+        return $cmp;
+    }
+
+    return strnatcasecmp($a['name'], $b['name']);
+});
+
+$total = count($filtered);
+$totalPages = max(1, (int)ceil($total / $perPage));
+$page = min($page, $totalPages);
+$offset = ($page - 1) * $perPage;
+$pageItems = array_slice($filtered, $offset, $perPage);
+
+function page_url(int $page): string
+{
+    $params = $_GET;
+    $params['page'] = $page;
+    return '?' . http_build_query($params);
+}
+
+$csrf = csrf_token();
+?>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Audio Archive</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+    --bg: #20272d;
+    --top: #050606;
+    --side: #293139;
+    --side-dark: #20262c;
+    --side-active: #161b20;
+    --panel: #232a30;
+    --panel2: #1f252b;
+    --line: #3b4650;
+    --line2: #4a5864;
+    --text: #e7edf2;
+    --muted: #aab5bf;
+    --blue: #1f7aec;
+    --blue2: #5aa1ff;
+    --red: #f04455;
+    --green: #14c784;
+    --yellow: #ffc857;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    min-height: 100%;
+}
+
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+
+a {
+    color: inherit;
+}
+
+.app {
+    min-height: 100vh;
+}
+
+.topbar {
+    height: 58px;
+    background: var(--top);
+    display: flex;
+    align-items: center;
+    padding: 0 22px;
+    border-bottom: 1px solid #111;
+}
+
+.logo {
+    font-size: 30px;
+    font-weight: 900;
+    font-style: italic;
+    letter-spacing: -2px;
+    color: #fff;
+}
+
+.shell {
+    display: grid;
+    grid-template-columns: 305px minmax(0, 1fr);
+    min-height: calc(100vh - 58px);
+}
+
+.sidebar {
+    background: var(--side);
+    border-right: 1px solid var(--line);
+}
+
+.menu-section {
+    padding: 18px 0;
+    border-bottom: 1px solid var(--line);
+}
+
+.menu-title {
+    padding: 12px 24px;
+    color: #9fb0bd;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.nav-item {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    height: 40px;
+    padding: 0 22px;
+    color: #5aa1ff;
+    text-decoration: none;
+    font-size: 16px;
+}
+
+.nav-item:hover {
+    background: rgba(255,255,255,.04);
+}
+
+.nav-item.active {
+    background: var(--side-active);
+    color: #fff;
+    font-weight: 800;
+}
+
+.nav-icon {
+    width: 22px;
+    text-align: center;
+    font-size: 20px;
+}
+
+.content {
+    padding: 18px 20px 34px;
+    overflow: hidden;
+}
+
+.page-title {
+    font-size: 26px;
+    font-weight: 800;
+    margin: 0 0 12px;
+}
+
+.rule {
+    height: 1px;
+    background: var(--line);
+    margin: 8px 0 14px;
+}
+
+.filters {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) 170px 170px 130px 110px;
+    gap: 8px;
+    align-items: end;
+}
+
+.field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 7px;
+    color: var(--text);
+}
+
+.input,
+.select {
+    width: 100%;
+    height: 34px;
+    border: 1px solid var(--line2);
+    border-radius: 5px;
+    background: var(--panel2);
+    color: var(--text);
+    padding: 0 10px;
+    outline: none;
+}
+
+.input:focus,
+.select:focus {
+    border-color: var(--blue2);
+    box-shadow: 0 0 0 2px rgba(31,122,236,.18);
+}
+
+.btn {
+    height: 34px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 0 12px;
+    color: #fff;
+    cursor: pointer;
+    font-weight: 700;
+    font-size: 13px;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-blue {
+    background: var(--blue);
+}
+
+.btn-red {
+    background: var(--red);
+}
+
+.btn-muted {
+    background: transparent;
+    border-color: var(--line2);
+    color: var(--muted);
+}
+
+.btn-dark {
+    background: #1b2228;
+    border-color: var(--line);
+    color: var(--text);
+}
+
+.btn:disabled,
+.btn.disabled {
+    opacity: .45;
+    pointer-events: none;
+}
+
+.actions-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 18px 0 12px;
+}
+
+.summary {
+    margin-left: 10px;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.flash {
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin: 12px 0;
+    border: 1px solid var(--line2);
+}
+
+.flash.success {
+    color: #b8ffda;
+    background: rgba(20,199,132,.12);
+    border-color: rgba(20,199,132,.35);
+}
+
+.flash.danger {
+    color: #ffd2d8;
+    background: rgba(240,68,85,.12);
+    border-color: rgba(240,68,85,.35);
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(260px, 1fr));
+    gap: 12px;
+}
+
+.card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    overflow: hidden;
+}
+
+.card-main {
+    padding: 13px 14px 12px;
+}
+
+.card-top {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.check {
+    margin-top: 2px;
+}
+
+.audio-title {
+    min-width: 0;
+    flex: 1;
+}
+
+.audio-name {
+    font-size: 15px;
+    font-weight: 800;
+    color: var(--text);
+    word-break: break-word;
+}
+
+.freq {
+    color: var(--blue2);
+    font-family: Consolas, Monaco, monospace;
+}
+
+.audio-meta {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.wave {
+    margin-top: 12px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    overflow: hidden;
+}
+
+.bar {
+    width: 4px;
+    min-width: 4px;
+    border-radius: 2px;
+    background: linear-gradient(to top, #1266d9, #45cfff);
+    opacity: .86;
+}
+
+.card-actions {
+    display: flex;
+    gap: 6px;
+    padding: 0 14px 13px;
+}
+
+.player-row {
+    padding: 0 14px 13px;
+    display: none;
+}
+
+.card.playing .player-row {
+    display: block;
+}
+
+audio {
+    width: 100%;
+    height: 34px;
+}
+
+.empty {
+    padding: 40px 20px;
+    color: var(--muted);
+    border: 1px dashed var(--line2);
+    border-radius: 8px;
+    text-align: center;
+}
+
+.pagination {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    margin: 18px 0 0;
+}
+
+.page-label {
+    color: var(--muted);
+    font-weight: 700;
+    padding: 0 10px;
+}
+
+.footer-note {
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+@media (max-width: 1400px) {
+    .grid {
+        grid-template-columns: repeat(2, minmax(260px, 1fr));
+    }
+
+    .filters {
+        grid-template-columns: minmax(220px, 1fr) 160px 160px;
+    }
+}
+
+@media (max-width: 920px) {
+    .shell {
+        grid-template-columns: 1fr;
+    }
+
+    .sidebar {
+        display: none;
+    }
+
+    .filters {
+        grid-template-columns: 1fr;
+    }
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+</head>
+<body>
+<div class="app">
+    <header class="topbar">
+        <div class="logo">IFZ</div>
+    </header>
+
+    <div class="shell">
+        <aside class="sidebar">
+            <div class="menu-section">
+                <a class="nav-item" href="/index.php">
+                    <span class="nav-icon">⌂</span>
+                    <span>Home</span>
+                </a>
+                <a class="nav-item" href="/playback.php">
+                    <span class="nav-icon">⊙</span>
+                    <span>Recorder Playback</span>
+                </a>
+                <a class="nav-item active" href="/showaudio.php">
+                    <span class="nav-icon">▣</span>
+                    <span>Audio Archive</span>
+                </a>
+            </div>
+
+            <div class="menu-section">
+                <div class="menu-title">Device Manager</div>
+
+                <a class="nav-item" href="/users.php">
+                    <span class="nav-icon">♙</span>
+                    <span>Users</span>
+                </a>
+                <a class="nav-item" href="/showimg.php">
+                    <span class="nav-icon">▧</span>
+                    <span>Picture</span>
+                </a>
+                <a class="nav-item" href="/dflog.php">
+                    <span class="nav-icon">▤</span>
+                    <span>DFlog Viewer</span>
+                </a>
+                <a class="nav-item" href="/dfrolesetting.php">
+                    <span class="nav-icon">⚙</span>
+                    <span>DF Role Setting</span>
+                </a>
+                <a class="nav-item" href="/dfdevicesetting.php">
+                    <span class="nav-icon">◉</span>
+                    <span>DF Device Settings</span>
+                </a>
+                <a class="nav-item" href="/settings.php">
+                    <span class="nav-icon">⚙</span>
+                    <span>Settings</span>
+                </a>
+                <a class="nav-item" href="/network.php">
+                    <span class="nav-icon">≋</span>
+                    <span>Wi-Fi & LTE Settings</span>
+                </a>
+                <a class="nav-item" href="/register.php">
+                    <span class="nav-icon">＋</span>
+                    <span>Register Device</span>
+                </a>
+                <a class="nav-item" href="/logout.php">
+                    <span class="nav-icon">↪</span>
+                    <span>Sign out(admin)</span>
+                </a>
+            </div>
+        </aside>
+
+        <main class="content">
+            <h1 class="page-title">Audio Archive</h1>
+            <div class="rule"></div>
+
+            <?php if ($flash !== ''): ?>
+                <div class="flash <?= h($flashType) ?>"><?= h($flash) ?></div>
+            <?php endif; ?>
+
+            <form method="get" class="filters">
+                <div class="field">
+                    <label>Search (path/name/frequency)</label>
+                    <input class="input" type="text" name="q" value="<?= h($q) ?>" placeholder="e.g. 121.100 or 41-44">
+                </div>
+
+                <div class="field">
+                    <label>Date</label>
+                    <input class="input" type="date" name="date" value="<?= h($date) ?>">
+                </div>
+
+                <div class="field">
+                    <label>Month</label>
+                    <input class="input" type="month" name="month" value="<?= h($month) ?>">
+                </div>
+
+                <div class="field">
+                    <label>Year</label>
+                    <select class="select" name="year">
+                        <option value="">All</option>
+                        <?php foreach ($years as $y): ?>
+                            <option value="<?= h($y) ?>" <?= $year === $y ? 'selected' : '' ?>><?= h($y) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Show</label>
+                    <select class="select" name="per_page" onchange="this.form.submit()">
+                        <?php foreach ($perPageOptions as $opt): ?>
+                            <option value="<?= (int)$opt ?>" <?= $perPage === $opt ? 'selected' : '' ?>><?= (int)$opt ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="field" style="grid-column: 1 / -1;">
+                    <button class="btn btn-blue" type="submit">Filter</button>
+                    <a class="btn btn-muted" href="/showaudio.php">Clear</a>
+                </div>
+            </form>
+
+            <form method="post" id="bulkForm">
+                <input type="hidden" name="csrf" value="<?= h($csrf) ?>">
+                <input type="hidden" name="action" value="delete_selected">
+
+                <div class="actions-row">
+                    <button type="button" class="btn btn-muted" onclick="selectAllAudio()">Select All</button>
+                    <button type="button" class="btn btn-muted" onclick="clearAudioSelection()">Clear</button>
+                    <button type="submit" class="btn btn-red" onclick="return confirmDeleteSelected()">Delete Selected</button>
+
+                    <span class="summary">
+                        Selected: <span id="selectedCount">0</span> ·
+                        Total: <?= (int)$total ?> ·
+                        Latest first
+                    </span>
+                </div>
+
+                <?php if (count($pageItems) === 0): ?>
+                    <div class="empty">
+                        No audio files found for the current filter.
+                    </div>
+                <?php else: ?>
+                    <section class="grid">
+                        <?php foreach ($pageItems as $item): ?>
+                            <?php
+                                $title = $item['frequency'] !== '' ? $item['frequency'] : $item['displayName'];
+                                $waveSeed = crc32($item['relative']);
+                            ?>
+                            <article class="card" data-card>
+                                <div class="card-main">
+                                    <div class="card-top">
+                                        <input class="check audio-check" type="checkbox" name="files[]" value="<?= h($item['relative']) ?>" onchange="updateSelectedCount()">
+
+                                        <div class="audio-title">
+                                            <div class="audio-name">
+                                                <span class="freq"><?= h($title) ?></span>
+                                            </div>
+
+                                            <div class="audio-meta">
+                                                <?= h($item['name']) ?><br>
+                                                <?= h($item['dateLabel']) ?> <?= h($item['timeLabel']) ?>
+                                                · <?= h($item['sizeLabel']) ?><br>
+                                                <?= h($item['folder']) ?> / <?= h($item['channel']) ?>
+                                            </div>
+
+                                            <div class="wave">
+                                                <?php for ($i = 0; $i < 48; $i++): ?>
+                                                    <?php
+                                                        $height = 6 + abs((int)(($waveSeed >> ($i % 16)) + ($i * 11)) % 25);
+                                                    ?>
+                                                    <span class="bar" style="height: <?= (int)$height ?>px"></span>
+                                                <?php endfor; ?>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="card-actions">
+                                    <button class="btn btn-blue" type="button" onclick="playCard(this, '<?= h($item['url']) ?>')">Play</button>
+                                    <a class="btn btn-dark" href="<?= h($item['url']) ?>" download>Download</a>
+
+                                    <button class="btn btn-red" type="button" onclick="deleteOne('<?= h($item['relative']) ?>')">Delete</button>
+                                </div>
+
+                                <div class="player-row">
+                                    <audio controls preload="none"></audio>
+                                </div>
+                            </article>
+                        <?php endforeach; ?>
+                    </section>
+                <?php endif; ?>
+            </form>
+
+            <form method="post" id="deleteOneForm" style="display:none;">
+                <input type="hidden" name="csrf" value="<?= h($csrf) ?>">
+                <input type="hidden" name="action" value="delete_one">
+                <input type="hidden" name="file" id="deleteOneFile" value="">
+            </form>
+
+            <nav class="pagination">
+                <a class="btn btn-muted <?= $page <= 1 ? 'disabled' : '' ?>" href="<?= h(page_url(1)) ?>">First</a>
+                <a class="btn btn-muted <?= $page <= 1 ? 'disabled' : '' ?>" href="<?= h(page_url(max(1, $page - 1))) ?>">Previous</a>
+
+                <span class="page-label">Page <?= (int)$page ?> / <?= (int)$totalPages ?></span>
+
+                <a class="btn btn-muted <?= $page >= $totalPages ? 'disabled' : '' ?>" href="<?= h(page_url(min($totalPages, $page + 1))) ?>">Next</a>
+                <a class="btn btn-muted <?= $page >= $totalPages ? 'disabled' : '' ?>" href="<?= h(page_url($totalPages)) ?>">Last</a>
+            </nav>
+
+            <div class="footer-note">
+                Source: /var/www/html/audiofiles · Newest recordings are always shown first.
+            </div>
+        </main>
+    </div>
+</div>
+
+<script>
+function updateSelectedCount() {
+    const count = document.querySelectorAll('.audio-check:checked').length;
+    const el = document.getElementById('selectedCount');
+    if (el) {
+        el.textContent = String(count);
+    }
+}
+
+function selectAllAudio() {
+    document.querySelectorAll('.audio-check').forEach(cb => cb.checked = true);
+    updateSelectedCount();
+}
+
+function clearAudioSelection() {
+    document.querySelectorAll('.audio-check').forEach(cb => cb.checked = false);
+    updateSelectedCount();
+}
+
+function confirmDeleteSelected() {
+    const count = document.querySelectorAll('.audio-check:checked').length;
+
+    if (count <= 0) {
+        alert('Please select audio files first.');
+        return false;
+    }
+
+    return confirm('Delete ' + count + ' selected audio file(s)?');
+}
+
+function deleteOne(relativePath) {
+    if (!confirm('Delete this audio file?')) {
+        return;
+    }
+
+    document.getElementById('deleteOneFile').value = relativePath;
+    document.getElementById('deleteOneForm').submit();
+}
+
+function playCard(button, url) {
+    const card = button.closest('[data-card]');
+    if (!card) {
+        return;
+    }
+
+    const audio = card.querySelector('audio');
+    if (!audio) {
+        return;
+    }
+
+    document.querySelectorAll('[data-card]').forEach(other => {
+        if (other !== card) {
+            other.classList.remove('playing');
+            const otherAudio = other.querySelector('audio');
+            if (otherAudio) {
+                otherAudio.pause();
+            }
+        }
+    });
+
+    if (audio.getAttribute('src') !== url) {
+        audio.setAttribute('src', url);
+    }
+
+    card.classList.add('playing');
+
+    audio.play().catch(err => {
+        console.warn('Audio playback failed:', err);
+    });
+}
+
+updateSelectedCount();
+</script>
+</body>
+</html>

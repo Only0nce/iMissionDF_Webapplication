@@ -438,7 +438,7 @@ if (!$baseReal) {
               </a>
             </li>
             <li class="nav-item">
-              <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="audiofiles">
+              <a class="nav-link d-flex align-items-center gap-2" aria-current="page" href="showaudio.php">
                 <svg class="bi"><use xlink:href="fontawesome-free-5.15.4-web/sprites/regular.svg?v=<?php echo time();?>#file-audio"/></svg>
                 Audio Archive
               </a>

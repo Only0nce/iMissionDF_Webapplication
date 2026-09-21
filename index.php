@@ -14,6 +14,20 @@
   $userLevelAdmin = $_SESSION['userLevel'];
 
   $userName = $_SESSION['userName'] ?? '';
+
+  // AstraRX receiver backend endpoint.
+  //
+  // A browser cannot use the Qt process' 127.0.0.1 default when the page is
+  // opened from another machine: in JavaScript, 127.0.0.1 means the browser
+  // machine itself.  Keep ASTRARX_WS_URL as an optional deployment override,
+  // but leave the value empty when it is not set so webrx.js can derive the
+  // endpoint from window.location.hostname (for example 192.168.10.68).
+  $astraRxWsUrl = getenv('ASTRARX_WS_URL');
+  if (!is_string($astraRxWsUrl)) {
+    $astraRxWsUrl = '';
+  } else {
+    $astraRxWsUrl = trim($astraRxWsUrl);
+  }
 ?>
 
 <?php
@@ -927,7 +941,7 @@ include('ListAudioGain.php');
                             </li> -->
                             <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
-                                    href="audiofiles">
+                                    href="showaudio.php">
                                     <svg class="bi">
                                         <use
                                             xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg?v=<?php echo time();?>#file-audio" />
@@ -935,7 +949,7 @@ include('ListAudioGain.php');
                                     Audio Archive
                                 </a>
                             </li>
-                            <li class="nav-item">
+                            <!-- <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" aria-current="page"
                                     href="mapvisual.php">
                                     <svg class="bi">
@@ -943,7 +957,7 @@ include('ListAudioGain.php');
                                     </svg>
                                     Map Visual
                                 </a>
-                            </li>
+                            </li> -->
                         </ul>
 
                         <hr class="my-3">
@@ -1003,7 +1017,14 @@ include('ListAudioGain.php');
                                     Settings
                                 </a>
                             </li>
-
+                            <li class="nav-item">
+                                <a class="nav-link d-flex align-items-center gap-2" href="wifi.php">
+                                    <svg class="bi">
+                                        <use xlink:href="fontawesome-free-5.15.4-web/sprites/solid.svg#wifi" />
+                                    </svg>
+                                    Wi-Fi & LTE Settings
+                                </a>
+                            </li>
                             <li class="nav-item">
                                 <a class="nav-link d-flex align-items-center gap-2" href="controler.php">
                                     <svg class="bi">
@@ -1522,6 +1543,12 @@ include('ListAudioGain.php');
 
         <script>
         const SETTINGS_JSON = <?php echo file_get_contents("/var/lib/openwebrx/settings.json"); ?>;
+        window.ASTRARX_WS_URL = <?php
+            echo json_encode(
+                $astraRxWsUrl,
+                JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
+            );
+        ?>;
         </script>
 
         <!-- Add New Preset Modal -->

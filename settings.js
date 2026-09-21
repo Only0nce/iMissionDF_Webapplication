@@ -6,6 +6,12 @@ var userID = 0;
 
 // Store frequency values from AlsaRecConfigManager
 var recFrequency = {}; // { iGateID: freq }
+
+// Runtime LAN mapping from NetworkController::loadAllLanConfig().
+// Never assume that UI index 0..3 always maps to a hard-coded Linux interface.
+var lanInterfaceByIndex = {};
+var lanKeyByIndex = {};
+var lastLanList = [];
 // WebSocketTest();
 function WebSocketTest() {
   if ("WebSocket" in window) {
@@ -21,13 +27,16 @@ function WebSocketTest() {
       ws.send('{"menuID":"getVuMeter"}');
       ws.send('{"menuID":"getServerHomePage", "iGateNum":1}');
       ws.send('{"menuID":"getServerHomePage", "iGateNum":2}');
+      vpnInitRememberOvpn();
+      vpnStatus();
+      vpnRefreshPublicIp();
       // ws.send('{"menuID":"getServerHomePage", "iGateNum":3}');
       // ws.send('{"menuID":"getServerHomePage", "iGateNum":4}');
     };
 
     ws.onmessage = function (evt) {
       var received_msg = evt.data;
-      console.log("WS (8049) received:", received_msg);
+      // console.log("WS (8049) received:", received_msg);
       processMsg(received_msg);
     };
 
@@ -94,65 +103,264 @@ function processMsg(message)
     }
   }
   else if (obj.menuID === "network") {
-    function safeStr(v) { return (v === undefined || v === null) ? "" : String(v); }
+    // Expected backend contract:
+    // {
+    //   menuID: "network",
+    //   lan: { lan1:{...}, lan2:{...}, rfsoc1:{...}, rfsoc2:{...} },
+    //   lanList: [ {...}, {...}, ... ]
+    // }
+    //
+    // one LAN row may contain:
+    // key, name, label, iface/interface, mode,
+    // configuredIp, configuredGateway,
+    // ip, gateway, dns, dns2, dnsList,
+    // liveIp, liveGateway, liveNetmask,
+    // netmask, mac/macAddress, status, speed, duplex, ...
 
-    function parseIpCidr(ipCidr) {
-      const s = safeStr(ipCidr).trim();
-      if (!s) return { ip: "", netmask: "" };
-      const parts = s.split("/");
-      const ip = parts[0] || "";
-      const cidr = parts[1];
-      const netmask = (cidr !== undefined && cidr !== "") ? cidrToNetmask(cidr) : "";
-      return { ip, netmask };
+    function safeStr(v) {
+      return (v === undefined || v === null) ? "" : String(v).trim();
+    }
+
+    function firstNonEmpty() {
+      for (let i = 0; i < arguments.length; i++) {
+        const value = safeStr(arguments[i]);
+        if (value !== "") return value;
+      }
+      return "";
+    }
+
+    function parseIpCidr(value) {
+      const raw = safeStr(value);
+      if (!raw) return { ip: "", prefix: null, netmask: "" };
+
+      const slash = raw.indexOf("/");
+      if (slash < 0) {
+        return { ip: raw, prefix: null, netmask: "" };
+      }
+
+      const ip = raw.substring(0, slash).trim();
+      const prefixText = raw.substring(slash + 1).trim();
+      const prefix = Number(prefixText);
+      const validPrefix = Number.isInteger(prefix) && prefix >= 0 && prefix <= 32;
+
+      return {
+        ip: ip,
+        prefix: validPrefix ? prefix : null,
+        netmask: validPrefix ? cidrToNetmask(prefix) : ""
+      };
+    }
+
+    function splitDns(lanObj) {
+      let dns1 = safeStr(lanObj.dns);
+      let dns2 = safeStr(lanObj.dns2);
+
+      // Some backend revisions expose a joined dnsList.
+      const dnsList = safeStr(lanObj.dnsList);
+      if (dnsList) {
+        const listParts = dnsList
+          .replace(/;/g, ",")
+          .split(",")
+          .map(function (part) { return part.trim(); })
+          .filter(Boolean);
+
+        if (!dns1 && listParts.length > 0) dns1 = listParts[0];
+        if (!dns2 && listParts.length > 1) dns2 = listParts[1];
+      }
+
+      // Compatibility with older payloads that may send dns as an array.
+      if (Array.isArray(lanObj.dns)) {
+        dns1 = safeStr(lanObj.dns[0]);
+        dns2 = safeStr(lanObj.dns[1]);
+      } else if (dns1.indexOf(",") >= 0 || dns1.indexOf(";") >= 0) {
+        const parts = dns1
+          .replace(/;/g, ",")
+          .split(",")
+          .map(function (part) { return part.trim(); })
+          .filter(Boolean);
+        dns1 = parts[0] || "";
+        if (!dns2) dns2 = parts[1] || "";
+      }
+
+      return { dns1: dns1, dns2: dns2 };
+    }
+
+    function getLanRows(networkObj) {
+      if (Array.isArray(networkObj.lanList)) {
+        return networkObj.lanList.filter(function (row) {
+          return row && typeof row === "object";
+        });
+      }
+
+      const lan = (networkObj.lan && typeof networkObj.lan === "object")
+        ? networkObj.lan
+        : null;
+
+      if (!lan) {
+        // Compatibility with a single-row network payload.
+        return [networkObj];
+      }
+
+      // Keep the same deterministic order as C++ lanKeyOrder().
+      const preferredKeys = ["lan1", "lan2", "rfsoc1", "rfsoc2"];
+      const rows = [];
+      const used = {};
+
+      preferredKeys.forEach(function (key) {
+        if (lan[key] && typeof lan[key] === "object") {
+          rows.push(lan[key]);
+          used[key] = true;
+        }
+      });
+
+      Object.keys(lan).sort().forEach(function (key) {
+        if (!used[key] && lan[key] && typeof lan[key] === "object") {
+          rows.push(lan[key]);
+        }
+      });
+
+      return rows;
+    }
+
+    function setLanCardVisible(idx, visible) {
+      const card = document.getElementById("divEth" + idx);
+      if (card) card.style.display = visible ? "block" : "none";
     }
 
     function setLanUI(idx, lanObj) {
-      if (!lanObj) return;
+      if (!lanObj || typeof lanObj !== "object") return;
 
-      const { ip, netmask } = parseIpCidr(lanObj.ip || lanObj.ipaddress);
+      const iface = firstNonEmpty(lanObj.iface, lanObj.interface);
+      const lanKey = safeStr(lanObj.key);
+      const displayName = firstNonEmpty(
+        lanObj.name,
+        lanObj.label,
+        lanKey ? lanKey.toUpperCase() : "",
+        "LAN" + (idx + 1)
+      );
+
+      lanInterfaceByIndex[idx] = iface;
+      lanKeyByIndex[idx] = lanKey;
+
+      const ifaceHidden = document.getElementById("laniface" + idx);
+      if (ifaceHidden) ifaceHidden.value = iface;
+
+      const card = document.getElementById("divEth" + idx);
+      if (card) {
+        card.dataset.iface = iface;
+        card.dataset.lanKey = lanKey;
+      }
+
+      const nameEl = document.getElementById("DeviceName" + idx);
+      if (nameEl) {
+        nameEl.textContent = iface
+          ? (displayName + " · " + iface)
+          : displayName;
+        nameEl.dataset.iface = iface;
+        nameEl.dataset.lanKey = lanKey;
+      }
+
+      // C++ may replace "ip" with a live plain IPv4 address.
+      // Therefore subnet must not be derived from ip alone.
+      const effectiveIp = parseIpCidr(firstNonEmpty(
+        lanObj.ip,
+        lanObj.liveIp,
+        lanObj.configuredIp
+      ));
+      const configuredIp = parseIpCidr(lanObj.configuredIp);
+      const liveIp = parseIpCidr(lanObj.liveIp);
+
+      const ipAddress = firstNonEmpty(
+        effectiveIp.ip,
+        liveIp.ip,
+        configuredIp.ip
+      );
+
+      const netmask = firstNonEmpty(
+        lanObj.netmask,       // parseDeviceShow()/merged live value
+        lanObj.liveNetmask,   // explicit live netmask from C++
+        effectiveIp.netmask,  // if current ip still contains /prefix
+        liveIp.netmask,
+        configuredIp.netmask  // static JSON configuredIp commonly has CIDR
+      );
+
+      const gateway = firstNonEmpty(
+        lanObj.gateway,
+        lanObj.liveGateway,
+        lanObj.configuredGateway
+      );
+
+      const dns = splitDns(lanObj);
+      const mac = firstNonEmpty(
+        lanObj.macAddress,
+        lanObj.mac,
+        lanObj.hwAddress,
+        lanObj.hardwareAddress
+      );
+
       const ipEl = document.getElementById("ipaddress" + idx);
       const nmEl = document.getElementById("netmask" + idx);
       const gwEl = document.getElementById("gateway" + idx);
       const d1El = document.getElementById("dns1" + idx);
       const d2El = document.getElementById("dns2" + idx);
-      const dhcpLabel = document.getElementById("dhcpmethodLabel" + idx);
+      const macEl = document.getElementById("macaddress" + idx);
 
-      if (ipEl) ipEl.value = ip;
+      if (ipEl) ipEl.value = ipAddress;
       if (nmEl) nmEl.value = netmask;
-      if (gwEl) gwEl.value = safeStr(lanObj.gateway);
-
-      let dns1 = "", dns2 = "";
-      if (Array.isArray(lanObj.dns)) {
-        dns1 = safeStr(lanObj.dns[0]);
-        dns2 = safeStr(lanObj.dns[1]);
-      } else {
-        const dnsVal = safeStr(lanObj.dns);
-        if (dnsVal && dnsVal.indexOf(",") !== -1) {
-          const dnsParts = dnsVal.split(",");
-          dns1 = safeStr(dnsParts[0]);
-          dns2 = safeStr(dnsParts[1]);
-        } else {
-          dns1 = dnsVal;
-          dns2 = safeStr(lanObj.dns2);
-        }
-      }
-      if (d1El) d1El.value = dns1;
-      if (d2El) d2El.value = dns2;
+      if (gwEl) gwEl.value = gateway;
+      if (d1El) d1El.value = dns.dns1;
+      if (d2El) d2El.value = dns.dns2;
+      if (macEl) macEl.value = mac;
 
       const mode = safeStr(lanObj.mode).toLowerCase();
-      if (dhcpLabel && mode) {
-        dhcpLabel.textContent = (mode === "static") ? "Static" : "Automatic";
-      }
+      const isDhcp = (
+        mode === "dhcp" ||
+        mode === "auto" ||
+        mode === "automatic"
+      );
+
+      // Update both label/value and input enabled state.
+      setDHCP(idx, isDhcp ? "Automatic" : "Static");
+
+      setLanCardVisible(idx, true);
+
+      console.log("[network] LAN row", idx, {
+        key: lanKey,
+        iface: iface,
+        mode: mode,
+        ip: ipAddress,
+        netmask: netmask,
+        gateway: gateway,
+        dns1: dns.dns1,
+        dns2: dns.dns2,
+        mac: mac
+      });
     }
 
-    if (obj.lan && typeof obj.lan === "object") {
-      setLanUI(0, obj.lan.lan1 || obj.lan.LAN1 || obj.lan.eth0);
-      setLanUI(1, obj.lan.lan2 || obj.lan.LAN2 || obj.lan.eth1);
-      setLanUI(2, obj.lan.rfsoc1 || obj.lan.RFSoC1);
-      setLanUI(3, obj.lan.rfsoc2 || obj.lan.RFSoC2);
-    } else {
-      setLanUI(0, obj);
+    const rows = getLanRows(obj);
+    lastLanList = rows.slice();
+
+    // Hide old slots first so stale data is not shown when row count shrinks.
+    const cards = document.querySelectorAll('[id^="divEth"]');
+    for (let i = 0; i < cards.length; i++) {
+      setLanCardVisible(i, false);
     }
+
+    lanInterfaceByIndex = {};
+    lanKeyByIndex = {};
+
+    rows.forEach(function (lanRow, idx) {
+      if (document.getElementById("divEth" + idx)) {
+        setLanUI(idx, lanRow);
+      } else {
+        console.warn("[network] No UI LAN slot for backend row", idx, lanRow);
+      }
+    });
+
+    console.log("[network] applied loadAllLanConfig payload:", {
+      rowCount: rows.length,
+      lanInterfaceByIndex: lanInterfaceByIndex,
+      lanKeyByIndex: lanKeyByIndex
+    });
   } 
   else if (obj.object === "receiverStatus" || obj.menuID === "receiverStatus") {
     // Handle receiver status messages
@@ -311,7 +519,9 @@ function processMsg(message)
     else if (st === "TEARDOWN" || st === "ERROR") el.style.color = "#e95921ff";
     else el.style.color = "#6c757d";
   }
-
+  else if (obj.menuID === "vpnControl") {
+  vpnHandleWsMessage(obj);
+  }
 
 }
 function setRecorderStatus(el, state) {
@@ -351,121 +561,183 @@ function getStatusElementByIGateID(iGateID) {
 
 
 
-// Utility: convert CIDR to netmask
+// Utility: convert CIDR prefix (0..32) to dotted IPv4 netmask.
 function cidrToNetmask(cidr) {
-    const mask = [];
-    let bits = parseInt(cidr, 10);
-    for (let i = 0; i < 4; i++) {
-        if (bits >= 8) {
-            mask.push(255);
-            bits -= 8;
-        } else {
-            mask.push(256 - Math.pow(2, 8 - bits));
-            bits = 0;
-        }
-    }
-    return mask.join('.');
+  const prefix = Number(cidr);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+    return "";
+  }
+
+  const mask = [];
+  let bits = prefix;
+
+  for (let i = 0; i < 4; i++) {
+    const octetBits = Math.max(0, Math.min(8, bits));
+    mask.push(octetBits === 0 ? 0 : 256 - Math.pow(2, 8 - octetBits));
+    bits -= octetBits;
+  }
+
+  return mask.join(".");
 }
+
+function resolveLanInterface(index) {
+  const hidden = document.getElementById("laniface" + index);
+  if (hidden && hidden.value.trim()) {
+    return hidden.value.trim();
+  }
+
+  if (lanInterfaceByIndex[index]) {
+    return String(lanInterfaceByIndex[index]).trim();
+  }
+
+  const card = document.getElementById("divEth" + index);
+  if (card && card.dataset.iface) {
+    return String(card.dataset.iface).trim();
+  }
+
+  // Compatibility fallback only. Runtime backend mapping above has priority.
+  const legacyIfaces = ["enP8p1s0", "enP1p1s0", "end0", "end1"];
+  return legacyIfaces[index] || "";
+}
+
 function applyNetwork(index) {
-    var iface;
-    if(index === 0){
-        iface = "enP8p1s0";
-    }else if(index === 1){
-        iface = "enP1p1s0";
-    }
-    else if(index === 2){
-        iface = "end0";
-    }
-    else if(index === 3){
-        iface = "end1";
+  const iface = resolveLanInterface(index);
+  if (!iface) {
+    console.error("[network] Cannot apply: missing backend interface for UI index", index);
+    ModalCustomAlert("Cannot apply network: interface is not available.");
+    return;
+  }
+
+  const ipEl = document.getElementById("ipaddress" + index);
+  const netmaskEl = document.getElementById("netmask" + index);
+  const gatewayEl = document.getElementById("gateway" + index);
+  const dns1El = document.getElementById("dns1" + index);
+  const dns2El = document.getElementById("dns2" + index);
+  const modeLabelEl = document.getElementById("dhcpmethodLabel" + index);
+
+  if (!ipEl || !netmaskEl || !gatewayEl || !dns1El || !dns2El || !modeLabelEl) {
+    console.error("[network] Cannot apply: missing DOM fields for index", index);
+    ModalCustomAlert("Cannot apply network: page fields are incomplete.");
+    return;
+  }
+
+  const ip = ipEl.value.trim();
+  const netmask = netmaskEl.value.trim();
+  const gateway = gatewayEl.value.trim();
+  const dns1 = dns1El.value.trim();
+  const dns2 = dns2El.value.trim();
+
+  const modeText = modeLabelEl.textContent.trim().toLowerCase();
+  const mode = (modeText === "automatic" || modeText === "dhcp")
+    ? "dhcp"
+    : "static";
+
+  let ipWithCidr = ip;
+
+  if (mode === "static") {
+    if (!ip) {
+      ModalCustomAlert("IP Address is required for Static mode.");
+      return;
     }
 
-    const ip = document.getElementById("ipaddress" + index).value.trim();
-    const netmask = document.getElementById("netmask" + index).value.trim();
-    const gateway = document.getElementById("gateway" + index).value.trim();
-    const dns1 = document.getElementById("dns1" + index).value.trim();
-    const dns2 = document.getElementById("dns2" + index).value.trim();
-
-    // DHCP method
-    const modeLabel = document.getElementById("dhcpmethodLabel" + index).textContent.trim();
-    const mode = (modeLabel.toLowerCase() === "automatic") ? "dhcp" : "static";
-
-    // Convert netmask to CIDR
     const cidr = netmaskToCIDR(netmask);
-    const ipWithCidr = cidr ? ip + "/" + cidr : ip;
-
-    const data = {
-        menuID: "applyNetwork",
-        iface: iface,
-        mode: mode,
-        ip: ipWithCidr,
-        gateway: gateway,
-        dns: dns1 + (dns2 ? "," + dns2 : "")
-    };
-
-    // Send JSON message via WebSocket
-    if (ws.readyState == 1){
-        ws.send(JSON.stringify(data));
-        ModalCustomAlert("Setting up Network..."); 
-    }else{
-        alertConnection(); 
+    if (cidr === null) {
+      ModalCustomAlert("Invalid Subnet Mask. Example: 255.255.255.0");
+      return;
     }
+
+    ipWithCidr = ip + "/" + cidr;
+  }
+
+  const dnsList = [dns1, dns2].filter(Boolean).join(",");
+
+  // Contract consumed by Mainwindows -> NetworkController::applyNetworkConfig().
+  const data = {
+    menuID: "applyNetwork",
+    iface: iface,
+    mode: mode,
+    ip: ipWithCidr,
+    gateway: gateway,
+    dns: dnsList
+  };
+
+  console.log("[network] applyNetwork payload:", data);
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+    ModalCustomAlert("Setting up Network...");
+  } else {
+    alertConnection();
+  }
 }
 
-// Helper: Convert netmask to CIDR bits
+// Convert a contiguous dotted IPv4 netmask to CIDR prefix.
+// Returns null for invalid/non-contiguous masks.
 function netmaskToCIDR(mask) {
-    const parts = mask.split('.').map(Number);
-    let bits = 0;
-    for (let part of parts) {
-        bits += ((part >>> 0).toString(2).match(/1/g) || []).length;
+  const text = String(mask || "").trim();
+  const parts = text.split(".");
+
+  if (parts.length !== 4) {
+    return null;
+  }
+
+  let binary = "";
+
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d+$/.test(parts[i])) {
+      return null;
     }
-    return bits;
+
+    const value = Number(parts[i]);
+    if (!Number.isInteger(value) || value < 0 || value > 255) {
+      return null;
+    }
+
+    binary += value.toString(2).padStart(8, "0");
+  }
+
+  // IPv4 netmask must be contiguous ones followed by contiguous zeros.
+  if (!/^1*0*$/.test(binary)) {
+    return null;
+  }
+
+  const firstZero = binary.indexOf("0");
+  return firstZero < 0 ? 32 : firstZero;
 }
 
-function setDHCP(ethIndex,value)
+function setDHCP(ethIndex, value)
 {
-  phyNetworkNameEl = document.getElementById("DeviceName"+ethIndex);
-  dhcpmethodEl = document.getElementById("dhcpmethod"+ethIndex);
-  dhcpmethodLabel = document.getElementById("dhcpmethodLabel"+ethIndex);
-  ipaddressEl = document.getElementById("ipaddress"+ethIndex)
-  ipaddressE1El = document.getElementById("ipaddressE1"+ethIndex)
-  netmaskEl = document.getElementById("netmask"+ethIndex)
-  gatewayEl = document.getElementById("gateway"+ethIndex)
-  dns1El = document.getElementById("dns1"+ethIndex)
-  dns2El = document.getElementById("dns2"+ethIndex)
+  const dhcpmethodEl = document.getElementById("dhcpmethod" + ethIndex);
+  const dhcpmethodLabel = document.getElementById("dhcpmethodLabel" + ethIndex);
+  const ipaddressEl = document.getElementById("ipaddress" + ethIndex);
+  const netmaskEl = document.getElementById("netmask" + ethIndex);
+  const gatewayEl = document.getElementById("gateway" + ethIndex);
+  const dns1El = document.getElementById("dns1" + ethIndex);
+  const dns2El = document.getElementById("dns2" + ethIndex);
 
-  phyNetworkName = phyNetworkNameEl.innerHTML;
-  if ((value == "on") || (value == "Automatic"))
-  {
-    dhcpmethodLabel.innerHTML = "Automatic" ;
-    dhcpmethodEl.value = "on";
-    dhcpmethod = "on";
-  }
-  else
-  {
-    dhcpmethodLabel.innerHTML = "Static" ;
-    dhcpmethodEl.value = "off";
-    dhcpmethod = "off";
+  const normalized = String(value || "").trim().toLowerCase();
+  const isDhcp = (
+    normalized === "on" ||
+    normalized === "automatic" ||
+    normalized === "dhcp" ||
+    normalized === "auto"
+  );
+
+  if (dhcpmethodLabel) {
+    dhcpmethodLabel.textContent = isDhcp ? "Automatic" : "Static";
   }
 
-  if (dhcpmethod == 'on')
-  {
-    ipaddressEl.disabled = true;
-    ipaddressE1El.disabled = false;
-    netmaskEl.disabled = true;
-    gatewayEl.disabled = true;
-    dns1El.disabled = true;
-    dns2El.disabled = true;
+  if (dhcpmethodEl) {
+    dhcpmethodEl.value = isDhcp ? "on" : "off";
   }
-  else
-  {
-    ipaddressEl.disabled = false;
-    ipaddressE1El.disabled = false;
-    netmaskEl.disabled = false;
-    gatewayEl.disabled = false;
-    dns1El.disabled = false;
-    dns2El.disabled = false;    
-  }
+
+  // In DHCP mode these are runtime values from NetworkController/live nmcli.
+  // Keep them visible but read-only to prevent accidental editing.
+  if (ipaddressEl) ipaddressEl.disabled = isDhcp;
+  if (netmaskEl) netmaskEl.disabled = isDhcp;
+  if (gatewayEl) gatewayEl.disabled = isDhcp;
+  if (dns1El) dns1El.disabled = isDhcp;
+  if (dns2El) dns2El.disabled = isDhcp;
 }
 
 function ModalCustomAlertReload(text)
@@ -1011,6 +1283,254 @@ let iGate2Uri = iGate2UriEl.value;
     alert("Connection is closed...");
   }
 }
+
+/* ============================================================
+ * VPN (OpenVPN) addon for your existing structure
+ * - Remember selected .ovpn in localStorage (base64)
+ * - Apply:
+ *    1) if user selected file -> uploadOvpn
+ *    2) else if local cache -> uploadOvpn
+ *    3) else -> useRemembered (backend uses disk file)
+ * ============================================================ */
+
+const VPN_CACHE_KEY = "vpn_ovpn_cache_v1";
+
+function vpnLoadCache() {
+  try {
+    const raw = localStorage.getItem(VPN_CACHE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.filename || !obj.content_b64) return null;
+    return obj;
+  } catch (e) {
+    return null;
+  }
+}
+
+function vpnSaveCache(filename, content_b64) {
+  try {
+    localStorage.setItem(VPN_CACHE_KEY, JSON.stringify({
+      filename,
+      content_b64,
+      saved_at: Date.now()
+    }));
+  } catch (e) {}
+}
+
+function vpnClearRemembered() {
+  try { localStorage.removeItem(VPN_CACHE_KEY); } catch (e) {}
+  vpnUpdateRememberedUi();
+  ModalCustomAlert("Cleared remembered .ovpn (browser cache)");
+}
+
+function vpnUpdateRememberedUi() {
+  const el = document.getElementById("vpn_config_remember");
+  if (!el) return;
+
+  const cache = vpnLoadCache();
+  if (cache) {
+    const dt = new Date(cache.saved_at || Date.now());
+    el.textContent = `${cache.filename} (saved ${dt.toLocaleString()})`;
+  } else {
+    el.textContent = "-";
+  }
+}
+
+// optional: show backend remembered file name
+function vpnUpdateBackendRememberedUi(filename) {
+  const el = document.getElementById("vpn_config_remember_backend");
+  if (!el) return;
+  el.textContent = filename && filename.length ? filename : "-";
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function vpnInitRememberOvpn() {
+  const fileInput = document.getElementById("vpn_config");
+  if (fileInput && !fileInput.__vpnHooked) {
+    fileInput.__vpnHooked = true;
+
+    fileInput.addEventListener("change", function () {
+      const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+      if (!file) {
+        vpnUpdateRememberedUi();
+        return;
+      }
+      if (!file.name.toLowerCase().endsWith(".ovpn")) {
+        ModalCustomAlert("Only .ovpn file allowed");
+        return;
+      }
+      if (file.size > 512 * 1024) {
+        ModalCustomAlert("File too large (max 512KB)");
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = function () {
+        const b64 = arrayBufferToBase64(reader.result);
+        vpnSaveCache(file.name, b64);
+        vpnUpdateRememberedUi();
+        ModalCustomAlert(`Remembered: ${file.name}`);
+      };
+      reader.onerror = function () {
+        ModalCustomAlert("Read file failed");
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  vpnUpdateRememberedUi();
+}
+
+function vpnSend(obj) {
+  if (!ws || ws.readyState !== 1) {
+    ModalCustomAlert("WebSocket not connected");
+    return false;
+  }
+  ws.send(JSON.stringify(obj));
+  
+  return true;
+}
+
+function vpnApply() {
+  const enableEl = document.getElementById("vpn_enable");
+  const enable = enableEl ? !!enableEl.checked : false;
+
+  if (!enable) {
+    vpnSend({ menuID: "vpnControl", action: "stop" });
+    return;
+  }
+
+  const fileInput = document.getElementById("vpn_config");
+  const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+
+  // 1) new file -> uploadOvpn
+  if (file) {
+    if (!file.name.toLowerCase().endsWith(".ovpn")) {
+      ModalCustomAlert("Only .ovpn file allowed");
+      return;
+    }
+    if (file.size > 512 * 1024) {
+      ModalCustomAlert("File too large (max 512KB)");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function () {
+      const b64 = arrayBufferToBase64(reader.result);
+
+      // remember in browser too
+      vpnSaveCache(file.name, b64);
+      vpnUpdateRememberedUi();
+
+      vpnSend({
+        menuID: "vpnControl",
+        action: "uploadOvpn",
+        filename: file.name,
+        content_b64: b64
+      });
+    };
+    reader.onerror = function () {
+      ModalCustomAlert("Read file failed");
+    };
+    reader.readAsArrayBuffer(file);
+    return;
+  }
+
+  // 2) no file -> use browser cache
+  const cache = vpnLoadCache();
+  if (cache) {
+    vpnSend({
+      menuID: "vpnControl",
+      action: "uploadOvpn",
+      filename: cache.filename,
+      content_b64: cache.content_b64
+    });
+    return;
+  }
+
+  // 3) no cache -> let backend use remembered disk file
+  vpnSend({
+    menuID: "vpnControl",
+    action: "useRemembered"
+  });
+}
+
+// ===== receive side (ใน processMsg) =====
+/*
+else if (obj.menuID === "vpnControl") {
+  vpnHandleWsMessage(obj);
+}
+*/
+
+
+function vpnDisconnect() {
+  vpnSend({ menuID: "vpnControl", action: "stop" });
+}
+
+function vpnStart() {
+  vpnSend({ menuID: "vpnControl", action: "start" });
+}
+
+function vpnStatus() {
+  vpnSend({ menuID: "vpnControl", action: "status" });
+}
+
+function vpnRefreshPublicIp() {
+  vpnSend({ menuID: "vpnControl", action: "publicip" });
+}
+
+function vpnHandleWsMessage(obj) {
+  const st = document.getElementById("vpn_status");
+  const ip = document.getElementById("vpn_public_ip");
+  const en = document.getElementById("vpn_enable");
+  const cfgLoaded = document.getElementById("vpn_config_loaded");
+
+  if (st) {
+    st.textContent = obj.active ? "CONNECTED" : "DISCONNECTED";
+    st.classList.toggle("text-danger", !obj.active);
+    st.classList.toggle("text-success", !!obj.active);
+  }
+
+  // ip might be input or span
+  if (ip) {
+    if ("value" in ip) ip.value = obj.public_ip || "--";
+    else ip.textContent = obj.public_ip || "--";
+  }
+
+  if (en) {
+    if (typeof obj.enabled === "boolean") en.checked = obj.enabled;
+    else if (typeof obj.active === "boolean") en.checked = obj.active;
+  }
+
+  // backend remembered file name
+  if (typeof obj.remembered_file !== "undefined") {
+    vpnUpdateBackendRememberedUi(obj.remembered_file);
+  }
+
+  // optional show currently used config
+  if (cfgLoaded) {
+    const v = obj.config_loaded || obj.remembered_file || "--";
+    if ("value" in cfgLoaded) cfgLoaded.value = v;
+    else cfgLoaded.textContent = v;
+  }
+
+  if (obj.ok === false) {
+    ModalCustomAlert(obj.detail || "VPN error");
+  }
+}
+
+
+// // WebSocket variables
+
 
 
 

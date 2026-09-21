@@ -16,6 +16,7 @@ let offsetSnapStep = 1000;
 let waterfallMinDb = -120;
 let waterfallMaxDb = -30;
 let waterfallColorMap = [];
+let waterfallPaletteRevision = 0;
 let scanHistoryGroups = [];
 let memoryPresetsCache = [];
 let memoryFilterMode = "all";
@@ -39,7 +40,18 @@ let gridColor = prefersDark ? '#444' : '#ccc';
 let textColor = prefersDark ? '#ccc' : '#222';
 let bgColor = prefersDark ? '#111' : '#fefefe';
 
-var audio_buffer_maximal_length_sec = 1; //actual number of samples are calculated from sample rate
+// Legacy constructor argument retained for compatibility. Phase H owns the real
+// queue policy through AUDIO_LATENCY_PROFILE below.
+var audio_buffer_maximal_length_sec = 1;
+
+const AUDIO_LATENCY_PROFILE = Object.freeze({
+  targetQueueMs: 40,
+  startQueueMs: 40,
+  hardMaxQueueMs: 120,
+  statsIntervalMs: 1000,
+  workletModule: 'static/lib/AudioProcessor.js'
+});
+window.AUDIO_LATENCY_PROFILE = AUDIO_LATENCY_PROFILE;
 
 let maxHoldData = [];
 let showMaxHold = true;
@@ -56,6 +68,2144 @@ const zoomDefault = 1.0;    // ✅ ค่าขยายเริ่มต้น
 let waterfallEnabled = true;
 
 scanInterlock = false;
+
+
+// ============================================================================
+// AstraRX Engine Migration - Phase A/B/C/D/E/E.4/F/G/H/J/J.2/K (2026-09-16)
+// Phase A: diagnostics/instrumentation (no visual UI changes)
+// Phase B: server-authoritative ReceiverState + single FrequencyController
+// Phase C: latest-frame spectrum scheduler + cached static grid + pixel reduction
+// Phase D: waterfall RGBA row builder + ring history + rAF presentation
+// Phase E: persistent RF-domain waterfall + unified frequency view transform
+// Phase E.4: true viewport rendering + visible-bin processing (no giant canvases)
+// Phase F: data-driven waterfall intensity + quantile statistics + color LUT
+// Phase G: bounded tuning scheduler + local generation/stale-state guard
+// Phase H: bounded low-latency audio + AudioWorklet live-edge queue/fallback
+// Phase J: worker-offloaded waterfall history re-projection + sync fallback
+// Phase J.2: realtime worker dense-spectrum reduction + waterfall statistics offload
+// Phase K: production profiler / soak telemetry + adaptive runtime performance policy
+// ============================================================================
+
+const RECEIVER_MIN_HZ = 30e6;
+const RECEIVER_MAX_HZ = 3200e6;
+
+const ReceiverState = {
+  centerHz: center_freq,
+  offsetHz: offsetFrequency,
+  sampleRateHz: bandwidth,
+  fftSize: fft_size,
+  epoch: 0,
+  acquisitionEpoch: 0,
+  lastSource: "bootstrap"
+};
+window.ReceiverState = ReceiverState;
+
+// Unified frequency geometry for Spectrum, Waterfall, overlays, mouse tuning,
+// and diagnostics. The acquisition axis belongs to AstraRX; the view axis is
+// purely a browser presentation state and must never retune the RF source.
+const FrequencyViewTransform = (() => {
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function acquisitionStartHz() {
+    return ReceiverState.centerHz - ReceiverState.sampleRateHz / 2;
+  }
+
+  function acquisitionEndHz() {
+    return ReceiverState.centerHz + ReceiverState.sampleRateHz / 2;
+  }
+
+  function effectiveZoom() {
+    const z = Number(zoomLevel);
+    return Math.max(1, Number.isFinite(z) ? z : 1);
+  }
+
+  function getViewSnapshot() {
+    const container = document.getElementById('spectrum-container');
+    const acquisitionSpanHz = Math.max(1, ReceiverState.sampleRateHz);
+    const acquisitionStart = acquisitionStartHz();
+    const acquisitionEnd = acquisitionEndHz();
+    const zoom = effectiveZoom();
+    const viewSpanHz = Math.max(1, acquisitionSpanHz / zoom);
+    const pannableSpanHz = Math.max(0, acquisitionSpanHz - viewSpanHz);
+
+    let scrollRatio = 0;
+    let viewportWidth = 1;
+    let virtualWidth = 1;
+    if (container) {
+      viewportWidth = Math.max(1, Number(container.clientWidth) || 1);
+      virtualWidth = Math.max(viewportWidth, Number(container.scrollWidth) || viewportWidth);
+      const maxScroll = Math.max(0, virtualWidth - viewportWidth);
+      const scrollLeft = clamp(Number(container.scrollLeft) || 0, 0, maxScroll);
+      scrollRatio = maxScroll > 0 ? scrollLeft / maxScroll : 0;
+    }
+
+    const viewStartHz = acquisitionStart + pannableSpanHz * scrollRatio;
+    const viewEndHz = Math.min(acquisitionEnd, viewStartHz + viewSpanHz);
+
+    return {
+      acquisitionStartHz: acquisitionStart,
+      acquisitionEndHz: acquisitionEnd,
+      acquisitionSpanHz,
+      viewStartHz,
+      viewEndHz,
+      viewCenterHz: (viewStartHz + viewEndHz) / 2,
+      viewSpanHz: Math.max(1, viewEndHz - viewStartHz),
+      zoom,
+      scrollRatio,
+      viewportWidth,
+      virtualWidth
+    };
+  }
+
+  function frequencyToCanvasX(frequencyHz, canvasWidth) {
+    const width = Math.max(1, Number(canvasWidth) || 1);
+    const view = getViewSnapshot();
+    return ((Number(frequencyHz) - view.viewStartHz) / view.viewSpanHz) * width;
+  }
+
+  function canvasXToFrequency(x, canvasWidth) {
+    const width = Math.max(1, Number(canvasWidth) || 1);
+    const view = getViewSnapshot();
+    return view.viewStartHz + (Number(x) / width) * view.viewSpanHz;
+  }
+
+  function hzPerCanvasPixel(canvasWidth) {
+    return getViewSnapshot().viewSpanHz /
+      Math.max(1, Number(canvasWidth) || 1);
+  }
+
+  function visibleBinRange(sourceBins) {
+    const bins = Math.max(0, Math.floor(Number(sourceBins) || 0));
+    if (bins <= 0) return { start: 0, end: 0, count: 0 };
+    const view = getViewSnapshot();
+    const startNorm = clamp(
+      (view.viewStartHz - view.acquisitionStartHz) / view.acquisitionSpanHz,
+      0,
+      1
+    );
+    const endNorm = clamp(
+      (view.viewEndHz - view.acquisitionStartHz) / view.acquisitionSpanHz,
+      0,
+      1
+    );
+    const start = Math.max(0, Math.min(bins - 1, Math.floor(startNorm * bins)));
+    const end = Math.max(start + 1, Math.min(bins, Math.ceil(endNorm * bins)));
+    return { start, end, count: Math.max(0, end - start) };
+  }
+
+  function scrollToCenterHz(centerHz) {
+    const container = document.getElementById('spectrum-container');
+    if (!container) return false;
+    const view = getViewSnapshot();
+    const half = view.viewSpanHz / 2;
+    const minCenter = view.acquisitionStartHz + half;
+    const maxCenter = view.acquisitionEndHz - half;
+    const clampedCenter = clamp(Number(centerHz), minCenter, Math.max(minCenter, maxCenter));
+    const targetStart = clampedCenter - half;
+    const pannableSpanHz = Math.max(0, view.acquisitionSpanHz - view.viewSpanHz);
+    const ratio = pannableSpanHz > 0
+      ? clamp((targetStart - view.acquisitionStartHz) / pannableSpanHz, 0, 1)
+      : 0;
+    const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth);
+    container.scrollLeft = ratio * maxScroll;
+    return true;
+  }
+
+  return {
+    acquisitionStartHz,
+    acquisitionEndHz,
+    frequencyToCanvasX,
+    canvasXToFrequency,
+    hzPerCanvasPixel,
+    getViewSnapshot,
+    visibleBinRange,
+    scrollToCenterHz
+  };
+})();
+window.FrequencyViewTransform = FrequencyViewTransform;
+
+function webRxNowMs() {
+  return (typeof performance !== "undefined" && typeof performance.now === "function")
+    ? performance.now()
+    : Date.now();
+}
+
+const WebRxDiagnostics = (() => {
+  const counters = {
+    fftSourceFrames: 0,
+    spectrumPresentedFrames: 0,
+    spectrumCoalescedFrames: 0,
+    spectrumRenderMsTotal: 0,
+    spectrumRenderMsMax: 0,
+    waterfallSourceRows: 0,
+    waterfallPresentedFrames: 0,
+    waterfallCoalescedFrames: 0,
+    waterfallRowBuildMsTotal: 0,
+    waterfallRowBuildMsMax: 0,
+    waterfallPresentMsTotal: 0,
+    waterfallPresentMsMax: 0,
+    waterfallResets: 0,
+    waterfallIntensitySamples: 0,
+    waterfallIntensityUpdates: 0,
+    waterfallIntensityReprojects: 0,
+    waterfallPaletteRebuilds: 0,
+    serverStateUpdates: 0,
+    tuneCommands: 0,
+    tuneCenterCommands: 0,
+    tuneOffsetCommands: 0,
+    tuningIntents: 0,
+    tuningCoalescedRequests: 0,
+    tuningFlushes: 0,
+    tuningAcks: 0,
+    tuningStaleSuppressed: 0,
+    tuneSendFailures: 0,
+    audioPackets: 0,
+    audioHdPackets: 0,
+    audioInputBytes: 0,
+    audioResumeRequests: 0,
+    audioWorkletStarts: 0,
+    audioFallbackStarts: 0,
+    audioWorkletLoadFailures: 0,
+    waterfallWorkerRequests: 0,
+    waterfallWorkerCompletions: 0,
+    waterfallWorkerDiscards: 0,
+    waterfallWorkerFailures: 0,
+    waterfallWorkerCopiedBytes: 0,
+    waterfallWorkerMsTotal: 0,
+    waterfallWorkerMsMax: 0,
+    spectrumWorkerRequests: 0,
+    spectrumWorkerCompletions: 0,
+    spectrumWorkerDiscards: 0,
+    spectrumWorkerFailures: 0,
+    spectrumWorkerCopiedBytes: 0,
+    spectrumWorkerMsTotal: 0,
+    spectrumWorkerMsMax: 0,
+    waterfallStatsWorkerRequests: 0,
+    waterfallStatsWorkerCompletions: 0,
+    waterfallStatsWorkerDiscards: 0,
+    waterfallStatsWorkerFailures: 0,
+    waterfallStatsWorkerCopiedBytes: 0,
+    waterfallStatsWorkerMsTotal: 0,
+    waterfallStatsWorkerMsMax: 0,
+    lastTuneReason: "",
+    lastTuneType: "",
+    lastTuneHz: 0
+  };
+
+  let intervalStartMs = webRxNowMs();
+  let enabled = false;
+  try {
+    enabled = localStorage.getItem("webrxDiagnostics") === "1";
+  } catch (_) {}
+
+  function markFFTSource() {
+    counters.fftSourceFrames++;
+  }
+
+  function markSpectrumCoalesced() {
+    counters.spectrumCoalescedFrames++;
+  }
+
+  function markSpectrumPresented(renderMs) {
+    counters.spectrumPresentedFrames++;
+    counters.spectrumRenderMsTotal += renderMs;
+    counters.spectrumRenderMsMax = Math.max(counters.spectrumRenderMsMax, renderMs);
+  }
+
+  function markWaterfallRow(buildMs) {
+    counters.waterfallSourceRows++;
+    counters.waterfallRowBuildMsTotal += buildMs;
+    counters.waterfallRowBuildMsMax = Math.max(counters.waterfallRowBuildMsMax, buildMs);
+  }
+
+  function markWaterfallCoalesced() {
+    counters.waterfallCoalescedFrames++;
+  }
+
+  function markWaterfallPresented(renderMs) {
+    counters.waterfallPresentedFrames++;
+    counters.waterfallPresentMsTotal += renderMs;
+    counters.waterfallPresentMsMax = Math.max(counters.waterfallPresentMsMax, renderMs);
+  }
+
+  function markWaterfallReset() {
+    counters.waterfallResets++;
+  }
+
+  function markWaterfallIntensitySample() {
+    counters.waterfallIntensitySamples++;
+  }
+
+  function markWaterfallIntensityUpdate() {
+    counters.waterfallIntensityUpdates++;
+  }
+
+  function markWaterfallIntensityReproject() {
+    counters.waterfallIntensityReprojects++;
+  }
+
+  function markWaterfallPaletteRebuild() {
+    counters.waterfallPaletteRebuilds++;
+  }
+
+  function markServerState() {
+    counters.serverStateUpdates++;
+  }
+
+  function markTune(type, hz, reason) {
+    counters.tuneCommands++;
+    if (type === "setfrequency") counters.tuneCenterCommands++;
+    if (type === "offset_freq") counters.tuneOffsetCommands++;
+    counters.lastTuneReason = reason || "unknown";
+    counters.lastTuneType = type;
+    counters.lastTuneHz = Number(hz) || 0;
+  }
+
+  function markTuningIntent() { counters.tuningIntents++; }
+  function markTuningCoalesced() { counters.tuningCoalescedRequests++; }
+  function markTuningFlush() { counters.tuningFlushes++; }
+  function markTuningAck() { counters.tuningAcks++; }
+  function markTuningStaleSuppressed() { counters.tuningStaleSuppressed++; }
+  function markTuneSendFailure() { counters.tuneSendFailures++; }
+  function markAudioPacket(isHd, bytes) {
+    counters.audioPackets++;
+    if (isHd) counters.audioHdPackets++;
+    counters.audioInputBytes += Math.max(0, Number(bytes) || 0);
+  }
+  function markAudioResumeRequest() { counters.audioResumeRequests++; }
+  function markAudioEngineStart(kind) {
+    if (kind === "AudioWorklet") counters.audioWorkletStarts++;
+    else counters.audioFallbackStarts++;
+  }
+  function markAudioWorkletLoadFailure() { counters.audioWorkletLoadFailures++; }
+  function markWaterfallWorkerRequest(copiedBytes) {
+    counters.waterfallWorkerRequests++;
+    counters.waterfallWorkerCopiedBytes += Math.max(0, Number(copiedBytes) || 0);
+  }
+  function markWaterfallWorkerCompletion(workerMs) {
+    counters.waterfallWorkerCompletions++;
+    const value = Math.max(0, Number(workerMs) || 0);
+    counters.waterfallWorkerMsTotal += value;
+    counters.waterfallWorkerMsMax = Math.max(counters.waterfallWorkerMsMax, value);
+  }
+  function markWaterfallWorkerDiscard() { counters.waterfallWorkerDiscards++; }
+  function markWaterfallWorkerFailure() { counters.waterfallWorkerFailures++; }
+  function markSpectrumWorkerRequest(copiedBytes) {
+    counters.spectrumWorkerRequests++;
+    counters.spectrumWorkerCopiedBytes += Math.max(0, Number(copiedBytes) || 0);
+  }
+  function markSpectrumWorkerCompletion(workerMs) {
+    counters.spectrumWorkerCompletions++;
+    const value = Math.max(0, Number(workerMs) || 0);
+    counters.spectrumWorkerMsTotal += value;
+    counters.spectrumWorkerMsMax = Math.max(counters.spectrumWorkerMsMax, value);
+  }
+  function markSpectrumWorkerDiscard() { counters.spectrumWorkerDiscards++; }
+  function markSpectrumWorkerFailure() { counters.spectrumWorkerFailures++; }
+  function markWaterfallStatsWorkerRequest(copiedBytes) {
+    counters.waterfallStatsWorkerRequests++;
+    counters.waterfallStatsWorkerCopiedBytes += Math.max(0, Number(copiedBytes) || 0);
+  }
+  function markWaterfallStatsWorkerCompletion(workerMs) {
+    counters.waterfallStatsWorkerCompletions++;
+    const value = Math.max(0, Number(workerMs) || 0);
+    counters.waterfallStatsWorkerMsTotal += value;
+    counters.waterfallStatsWorkerMsMax = Math.max(counters.waterfallStatsWorkerMsMax, value);
+  }
+  function markWaterfallStatsWorkerDiscard() { counters.waterfallStatsWorkerDiscards++; }
+  function markWaterfallStatsWorkerFailure() { counters.waterfallStatsWorkerFailures++; }
+
+  function snapshot() {
+    const now = webRxNowMs();
+    const elapsedSec = Math.max(0.001, (now - intervalStartMs) / 1000);
+    const avgRenderMs = counters.spectrumPresentedFrames > 0
+      ? counters.spectrumRenderMsTotal / counters.spectrumPresentedFrames
+      : 0;
+    const avgWaterfallRowBuildMs = counters.waterfallSourceRows > 0
+      ? counters.waterfallRowBuildMsTotal / counters.waterfallSourceRows
+      : 0;
+    const avgWaterfallPresentMs = counters.waterfallPresentedFrames > 0
+      ? counters.waterfallPresentMsTotal / counters.waterfallPresentedFrames
+      : 0;
+    const avgWaterfallWorkerMs = counters.waterfallWorkerCompletions > 0
+      ? counters.waterfallWorkerMsTotal / counters.waterfallWorkerCompletions
+      : 0;
+    const avgSpectrumWorkerMs = counters.spectrumWorkerCompletions > 0
+      ? counters.spectrumWorkerMsTotal / counters.spectrumWorkerCompletions
+      : 0;
+    const avgWaterfallStatsWorkerMs = counters.waterfallStatsWorkerCompletions > 0
+      ? counters.waterfallStatsWorkerMsTotal / counters.waterfallStatsWorkerCompletions
+      : 0;
+
+    return {
+      elapsedSec: Number(elapsedSec.toFixed(2)),
+      fftSourceFps: Number((counters.fftSourceFrames / elapsedSec).toFixed(2)),
+      spectrumPresentFps: Number((counters.spectrumPresentedFrames / elapsedSec).toFixed(2)),
+      spectrumCoalescedFrames: counters.spectrumCoalescedFrames,
+      spectrumRenderMsAvg: Number(avgRenderMs.toFixed(3)),
+      spectrumRenderMsMax: Number(counters.spectrumRenderMsMax.toFixed(3)),
+      waterfallRowFps: Number((counters.waterfallSourceRows / elapsedSec).toFixed(2)),
+      waterfallPresentFps: Number((counters.waterfallPresentedFrames / elapsedSec).toFixed(2)),
+      waterfallCoalescedFrames: counters.waterfallCoalescedFrames,
+      waterfallRowBuildMsAvg: Number(avgWaterfallRowBuildMs.toFixed(3)),
+      waterfallRowBuildMsMax: Number(counters.waterfallRowBuildMsMax.toFixed(3)),
+      waterfallPresentMsAvg: Number(avgWaterfallPresentMs.toFixed(3)),
+      waterfallPresentMsMax: Number(counters.waterfallPresentMsMax.toFixed(3)),
+      waterfallResets: counters.waterfallResets,
+      waterfallIntensitySamples: counters.waterfallIntensitySamples,
+      waterfallIntensityUpdates: counters.waterfallIntensityUpdates,
+      waterfallIntensityReprojects: counters.waterfallIntensityReprojects,
+      waterfallPaletteRebuilds: counters.waterfallPaletteRebuilds,
+      waterfallIntensity: window.WaterfallIntensity &&
+        typeof window.WaterfallIntensity.snapshot === "function"
+          ? window.WaterfallIntensity.snapshot()
+          : null,
+      serverStateUpdates: counters.serverStateUpdates,
+      tuneCommands: counters.tuneCommands,
+      tuneCenterCommands: counters.tuneCenterCommands,
+      tuneOffsetCommands: counters.tuneOffsetCommands,
+      tuningIntents: counters.tuningIntents,
+      tuningCoalescedRequests: counters.tuningCoalescedRequests,
+      tuningFlushes: counters.tuningFlushes,
+      tuningAcks: counters.tuningAcks,
+      tuningStaleSuppressed: counters.tuningStaleSuppressed,
+      tuneSendFailures: counters.tuneSendFailures,
+      audioPackets: counters.audioPackets,
+      audioHdPackets: counters.audioHdPackets,
+      audioInputBytes: counters.audioInputBytes,
+      audioResumeRequests: counters.audioResumeRequests,
+      audioWorkletStarts: counters.audioWorkletStarts,
+      audioFallbackStarts: counters.audioFallbackStarts,
+      audioWorkletLoadFailures: counters.audioWorkletLoadFailures,
+      waterfallWorkerRequests: counters.waterfallWorkerRequests,
+      waterfallWorkerCompletions: counters.waterfallWorkerCompletions,
+      waterfallWorkerDiscards: counters.waterfallWorkerDiscards,
+      waterfallWorkerFailures: counters.waterfallWorkerFailures,
+      waterfallWorkerCopiedBytes: counters.waterfallWorkerCopiedBytes,
+      waterfallWorkerMsAvg: Number(avgWaterfallWorkerMs.toFixed(3)),
+      waterfallWorkerMsMax: Number(counters.waterfallWorkerMsMax.toFixed(3)),
+      waterfallWorker: window.WaterfallEngine &&
+        typeof window.WaterfallEngine.snapshot === "function"
+          ? window.WaterfallEngine.snapshot().worker
+          : null,
+      spectrumWorkerRequests: counters.spectrumWorkerRequests,
+      spectrumWorkerCompletions: counters.spectrumWorkerCompletions,
+      spectrumWorkerDiscards: counters.spectrumWorkerDiscards,
+      spectrumWorkerFailures: counters.spectrumWorkerFailures,
+      spectrumWorkerCopiedBytes: counters.spectrumWorkerCopiedBytes,
+      spectrumWorkerMsAvg: Number(avgSpectrumWorkerMs.toFixed(3)),
+      spectrumWorkerMsMax: Number(counters.spectrumWorkerMsMax.toFixed(3)),
+      waterfallStatsWorkerRequests: counters.waterfallStatsWorkerRequests,
+      waterfallStatsWorkerCompletions: counters.waterfallStatsWorkerCompletions,
+      waterfallStatsWorkerDiscards: counters.waterfallStatsWorkerDiscards,
+      waterfallStatsWorkerFailures: counters.waterfallStatsWorkerFailures,
+      waterfallStatsWorkerCopiedBytes: counters.waterfallStatsWorkerCopiedBytes,
+      waterfallStatsWorkerMsAvg: Number(avgWaterfallStatsWorkerMs.toFixed(3)),
+      waterfallStatsWorkerMsMax: Number(counters.waterfallStatsWorkerMsMax.toFixed(3)),
+      realtimeDspWorker: window.RealtimeDspWorker &&
+        typeof window.RealtimeDspWorker.snapshot === "function"
+          ? window.RealtimeDspWorker.snapshot()
+          : null,
+      audio: audioEngine && typeof audioEngine.getLatencySnapshot === "function"
+        ? audioEngine.getLatencySnapshot()
+        : null,
+      tuningGuard: window.TuningStateGuard &&
+        typeof window.TuningStateGuard.snapshot === "function"
+          ? window.TuningStateGuard.snapshot()
+          : null,
+      tuningScheduler: window.FrequencyController &&
+        typeof window.FrequencyController.getSchedulerSnapshot === "function"
+          ? window.FrequencyController.getSchedulerSnapshot()
+          : null,
+      lastTuneReason: counters.lastTuneReason,
+      lastTuneType: counters.lastTuneType,
+      lastTuneHz: counters.lastTuneHz,
+      receiver: {
+        centerHz: ReceiverState.centerHz,
+        offsetHz: ReceiverState.offsetHz,
+        receiverHz: ReceiverState.centerHz + ReceiverState.offsetHz,
+        sampleRateHz: ReceiverState.sampleRateHz,
+        fftSize: ReceiverState.fftSize,
+        epoch: ReceiverState.epoch,
+        acquisitionEpoch: ReceiverState.acquisitionEpoch,
+        lastSource: ReceiverState.lastSource
+      },
+      view: FrequencyViewTransform.getViewSnapshot(),
+      runtimePerformancePolicy: window.RuntimePerformancePolicy &&
+        typeof window.RuntimePerformancePolicy.snapshot === "function"
+          ? window.RuntimePerformancePolicy.snapshot()
+          : null
+    };
+  }
+
+  function reset() {
+    Object.keys(counters).forEach((key) => {
+      if (typeof counters[key] === "number") counters[key] = 0;
+      else counters[key] = "";
+    });
+    intervalStartMs = webRxNowMs();
+  }
+
+  function enable(flag = true) {
+    enabled = !!flag;
+    try {
+      localStorage.setItem("webrxDiagnostics", enabled ? "1" : "0");
+    } catch (_) {}
+    return enabled;
+  }
+
+  setInterval(() => {
+    if (enabled) console.log("[WEBRX-PERF]", snapshot());
+  }, 5000);
+
+  return {
+    enable,
+    snapshot,
+    reset,
+    markFFTSource,
+    markSpectrumCoalesced,
+    markSpectrumPresented,
+    markWaterfallRow,
+    markWaterfallCoalesced,
+    markWaterfallPresented,
+    markWaterfallReset,
+    markWaterfallIntensitySample,
+    markWaterfallIntensityUpdate,
+    markWaterfallIntensityReproject,
+    markWaterfallPaletteRebuild,
+    markServerState,
+    markTune,
+    markTuningIntent,
+    markTuningCoalesced,
+    markTuningFlush,
+    markTuningAck,
+    markTuningStaleSuppressed,
+    markTuneSendFailure,
+    markAudioPacket,
+    markAudioResumeRequest,
+    markAudioEngineStart,
+    markAudioWorkletLoadFailure,
+    markWaterfallWorkerRequest,
+    markWaterfallWorkerCompletion,
+    markWaterfallWorkerDiscard,
+    markWaterfallWorkerFailure,
+    markSpectrumWorkerRequest,
+    markSpectrumWorkerCompletion,
+    markSpectrumWorkerDiscard,
+    markSpectrumWorkerFailure,
+    markWaterfallStatsWorkerRequest,
+    markWaterfallStatsWorkerCompletion,
+    markWaterfallStatsWorkerDiscard,
+    markWaterfallStatsWorkerFailure
+  };
+})();
+window.WebRxDiagnostics = WebRxDiagnostics;
+
+// === RUNTIME PERFORMANCE POLICY (Phase K) ===
+//
+// These knobs alter presentation/offload cadence only. They never change RF,
+// DSP demodulation, tuning ownership, FFT content, or audio samples. The default
+// profile is the exact Phase J.2 behavior; adaptive mode is opt-in and can move
+// between these bounded profiles using measured browser health.
+const RuntimePerformancePolicy = (() => {
+  const defaults = Object.freeze({
+    spectrumWorkerDensityRatio: 2.0,
+    waterfallWorkerMinPixels: 96 * 1024,
+    waterfallStatsCadenceMultiplier: 1.0,
+    waterfallReprojectIntervalMultiplier: 1.0
+  });
+  const profiles = Object.freeze({
+    quality: Object.freeze({
+      spectrumWorkerDensityRatio: 2.5,
+      waterfallWorkerMinPixels: 128 * 1024,
+      waterfallStatsCadenceMultiplier: 1.0,
+      waterfallReprojectIntervalMultiplier: 1.0
+    }),
+    balanced: Object.freeze({ ...defaults }),
+    performance: Object.freeze({
+      spectrumWorkerDensityRatio: 1.25,
+      waterfallWorkerMinPixels: 64 * 1024,
+      waterfallStatsCadenceMultiplier: 1.75,
+      waterfallReprojectIntervalMultiplier: 1.67
+    })
+  });
+
+  let state = { ...defaults };
+  let profile = 'balanced';
+  let revision = 1;
+  let lastSource = 'bootstrap';
+
+  function clamp(value, min, max, fallback) {
+    const n = Number(value);
+    return Math.max(min, Math.min(max, Number.isFinite(n) ? n : fallback));
+  }
+
+  function sanitize(next) {
+    return {
+      spectrumWorkerDensityRatio: clamp(next.spectrumWorkerDensityRatio, 1.0, 6.0, state.spectrumWorkerDensityRatio),
+      waterfallWorkerMinPixels: Math.round(clamp(next.waterfallWorkerMinPixels, 16 * 1024, 512 * 1024, state.waterfallWorkerMinPixels)),
+      waterfallStatsCadenceMultiplier: clamp(next.waterfallStatsCadenceMultiplier, 0.5, 4.0, state.waterfallStatsCadenceMultiplier),
+      waterfallReprojectIntervalMultiplier: clamp(next.waterfallReprojectIntervalMultiplier, 0.5, 4.0, state.waterfallReprojectIntervalMultiplier)
+    };
+  }
+
+  function applyProfile(name, source = 'manual') {
+    const normalized = String(name || '').toLowerCase();
+    if (!profiles[normalized]) throw new Error(`Unknown runtime performance profile: ${name}`);
+    state = sanitize(profiles[normalized]);
+    profile = normalized;
+    lastSource = source;
+    revision++;
+    return snapshot();
+  }
+
+  function configure(options = {}, source = 'manual') {
+    state = sanitize({ ...state, ...options });
+    profile = 'custom';
+    lastSource = source;
+    revision++;
+    return snapshot();
+  }
+
+  function snapshot() {
+    return {
+      profile,
+      revision,
+      lastSource,
+      ...state
+    };
+  }
+
+  return {
+    applyProfile,
+    configure,
+    snapshot,
+    getSpectrumWorkerDensityRatio: () => state.spectrumWorkerDensityRatio,
+    getWaterfallWorkerMinPixels: () => state.waterfallWorkerMinPixels,
+    getWaterfallStatsCadenceMultiplier: () => state.waterfallStatsCadenceMultiplier,
+    getWaterfallReprojectIntervalMultiplier: () => state.waterfallReprojectIntervalMultiplier
+  };
+})();
+window.RuntimePerformancePolicy = RuntimePerformancePolicy;
+window.setRuntimePerformanceProfile = (name) => RuntimePerformancePolicy.applyProfile(name, 'console');
+window.configureRuntimePerformance = (options) => RuntimePerformancePolicy.configure(options, 'console');
+
+// === PRODUCTION PROFILER / SOAK ENGINE (Phase K) ===
+//
+// The profiler is intentionally low-rate and bounded. It keeps a rolling sample
+// window plus session aggregates, so a 24/48 hour soak does not grow memory with
+// runtime. Chromium long-task and heap telemetry are used when available and are
+// reported as unavailable rather than guessed on other browsers.
+const WebRxProductionProfiler = (() => {
+  const DEFAULT_INTERVAL_MS = 2000;
+  const DEFAULT_ROLLING_SAMPLES = 300; // 10 minutes at 2 s cadence
+  let running = false;
+  let timer = null;
+  let intervalMs = DEFAULT_INTERVAL_MS;
+  let rollingLimit = DEFAULT_ROLLING_SAMPLES;
+  let nextExpectedMs = 0;
+  let startedAtMs = 0;
+  let stoppedAtMs = 0;
+  let samples = [];
+  let longTaskObserver = null;
+  let longTaskTotalCount = 0;
+  let longTaskTotalMs = 0;
+  let longTaskMaxMs = 0;
+  let longTaskCountAtSample = 0;
+  let longTaskMsAtSample = 0;
+  let previousAudio = null;
+  let previousFailures = null;
+  let session = null;
+
+  function newSession() {
+    return {
+      samples: 0,
+      eventLoopLagMsTotal: 0,
+      eventLoopLagMsMax: 0,
+      longTaskCount: 0,
+      longTaskMs: 0,
+      longTaskMsMax: 0,
+      audioUnderruns: 0,
+      audioOverruns: 0,
+      audioDroppedMs: 0,
+      workerFailures: 0,
+      health: { stable: 0, watch: 0, stressed: 0, background: 0 },
+      heapStartMb: null,
+      heapLastMb: null,
+      heapMaxMb: null
+    };
+  }
+
+  function heapSnapshot() {
+    if (typeof performance === 'undefined' || !performance.memory) return null;
+    const used = Number(performance.memory.usedJSHeapSize);
+    const total = Number(performance.memory.totalJSHeapSize);
+    const limit = Number(performance.memory.jsHeapSizeLimit);
+    if (!Number.isFinite(used)) return null;
+    return {
+      usedMb: Number((used / 1048576).toFixed(2)),
+      totalMb: Number.isFinite(total) ? Number((total / 1048576).toFixed(2)) : null,
+      limitMb: Number.isFinite(limit) ? Number((limit / 1048576).toFixed(2)) : null
+    };
+  }
+
+  function counterDelta(current, previous) {
+    const a = Number(current) || 0;
+    const b = Number(previous) || 0;
+    return a >= b ? a - b : a; // diagnostics/worklet reset-safe
+  }
+
+  function workerFailureTotal(diag) {
+    return (Number(diag.waterfallWorkerFailures) || 0) +
+      (Number(diag.spectrumWorkerFailures) || 0) +
+      (Number(diag.waterfallStatsWorkerFailures) || 0);
+  }
+
+  function classify(sample) {
+    if (sample.visibility !== 'visible') return 'background';
+    if (sample.audioUnderrunsDelta >= 2 || sample.workerFailuresDelta > 0 ||
+        sample.eventLoopLagMs >= 75 || sample.longTaskMsDelta >= intervalMs * 0.25) {
+      return 'stressed';
+    }
+    if (sample.audioUnderrunsDelta > 0 || sample.audioOverrunsDelta > 0 ||
+        sample.eventLoopLagMs >= 25 || sample.longTaskMsDelta >= 100) {
+      return 'watch';
+    }
+    return 'stable';
+  }
+
+  function startLongTaskObserver() {
+    if (longTaskObserver || typeof PerformanceObserver !== 'function') return;
+    try {
+      longTaskObserver = new PerformanceObserver((list) => {
+        const entries = list.getEntries();
+        for (const entry of entries) {
+          const duration = Math.max(0, Number(entry.duration) || 0);
+          longTaskTotalCount++;
+          longTaskTotalMs += duration;
+          longTaskMaxMs = Math.max(longTaskMaxMs, duration);
+        }
+      });
+      longTaskObserver.observe({ entryTypes: ['longtask'] });
+    } catch (_) {
+      longTaskObserver = null;
+    }
+  }
+
+  function stopLongTaskObserver() {
+    if (!longTaskObserver) return;
+    try { longTaskObserver.disconnect(); } catch (_) {}
+    longTaskObserver = null;
+  }
+
+  function capture() {
+    const now = webRxNowMs();
+    let lag = Math.max(0, now - nextExpectedMs);
+    // A suspended/background tab can produce a huge timer jump. Record the
+    // visibility state, but do not let accumulated drift poison every sample.
+    if (lag > intervalMs * 10) nextExpectedMs = now + intervalMs;
+    else nextExpectedMs += intervalMs;
+
+    const diag = WebRxDiagnostics.snapshot();
+    const audio = diag.audio || {};
+    const failures = workerFailureTotal(diag);
+    const longCountDelta = counterDelta(longTaskTotalCount, longTaskCountAtSample);
+    const longMsDelta = Math.max(0, longTaskTotalMs - longTaskMsAtSample);
+    longTaskCountAtSample = longTaskTotalCount;
+    longTaskMsAtSample = longTaskTotalMs;
+
+    const audioUnderrunsDelta = previousAudio ? counterDelta(audio.underruns, previousAudio.underruns) : 0;
+    const audioOverrunsDelta = previousAudio ? counterDelta(audio.overruns, previousAudio.overruns) : 0;
+    const audioDroppedMsDelta = previousAudio ? Math.max(0, (Number(audio.droppedMs) || 0) - (Number(previousAudio.droppedMs) || 0)) : 0;
+    const workerFailuresDelta = previousFailures == null ? 0 : counterDelta(failures, previousFailures);
+    previousAudio = {
+      underruns: Number(audio.underruns) || 0,
+      overruns: Number(audio.overruns) || 0,
+      droppedMs: Number(audio.droppedMs) || 0
+    };
+    previousFailures = failures;
+
+    const heap = heapSnapshot();
+    const sample = {
+      atMs: Date.now(),
+      visibility: (typeof document !== 'undefined' && document.visibilityState) ? document.visibilityState : 'unknown',
+      eventLoopLagMs: Number(lag.toFixed(2)),
+      longTaskCountDelta: longCountDelta,
+      longTaskMsDelta: Number(longMsDelta.toFixed(2)),
+      audioUnderrunsDelta,
+      audioOverrunsDelta,
+      audioDroppedMsDelta: Number(audioDroppedMsDelta.toFixed(2)),
+      workerFailuresDelta,
+      heapUsedMb: heap ? heap.usedMb : null,
+      fftSourceFps: diag.fftSourceFps,
+      spectrumPresentFps: diag.spectrumPresentFps,
+      spectrumRenderMsAvg: diag.spectrumRenderMsAvg,
+      waterfallPresentMsAvg: diag.waterfallPresentMsAvg,
+      spectrumWorkerMsAvg: diag.spectrumWorkerMsAvg,
+      waterfallWorkerMsAvg: diag.waterfallWorkerMsAvg,
+      audioQueueMs: audio && Number.isFinite(Number(audio.queueMs)) ? Number(audio.queueMs) : null,
+      audioEngine: audio.engine || '',
+      runtimeProfile: RuntimePerformancePolicy.snapshot().profile
+    };
+    sample.health = classify(sample);
+
+    samples.push(sample);
+    if (samples.length > rollingLimit) samples.splice(0, samples.length - rollingLimit);
+
+    session.samples++;
+    session.eventLoopLagMsTotal += sample.eventLoopLagMs;
+    session.eventLoopLagMsMax = Math.max(session.eventLoopLagMsMax, sample.eventLoopLagMs);
+    session.longTaskCount += longCountDelta;
+    session.longTaskMs += longMsDelta;
+    session.longTaskMsMax = Math.max(session.longTaskMsMax, longTaskMaxMs);
+    session.audioUnderruns += audioUnderrunsDelta;
+    session.audioOverruns += audioOverrunsDelta;
+    session.audioDroppedMs += audioDroppedMsDelta;
+    session.workerFailures += workerFailuresDelta;
+    session.health[sample.health]++;
+    if (heap) {
+      if (session.heapStartMb == null) session.heapStartMb = heap.usedMb;
+      session.heapLastMb = heap.usedMb;
+      session.heapMaxMb = session.heapMaxMb == null ? heap.usedMb : Math.max(session.heapMaxMb, heap.usedMb);
+    }
+    return sample;
+  }
+
+  function percentile(values, p) {
+    const clean = values.filter(Number.isFinite).sort((a, b) => a - b);
+    if (!clean.length) return null;
+    const index = Math.max(0, Math.min(clean.length - 1, Math.ceil(p * clean.length) - 1));
+    return Number(clean[index].toFixed(2));
+  }
+
+  function summarizeRolling() {
+    if (!samples.length) return {
+      samples: 0,
+      visibleSamples: 0,
+      backgroundSamples: 0,
+      windowSec: 0,
+      eventLoopLagP50Ms: null,
+      eventLoopLagP95Ms: null,
+      eventLoopLagMaxMs: null,
+      longTaskCount: 0,
+      longTaskMsPerSec: 0,
+      audioUnderruns: 0,
+      audioOverruns: 0,
+      audioDroppedMs: 0,
+      workerFailures: 0,
+      heapUsedMbFirst: null,
+      heapUsedMbLast: null,
+      heapGrowthMb: null,
+      healthCounts: { stable: 0, watch: 0, stressed: 0, background: 0 }
+    };
+    const visible = samples.filter(s => s.visibility === 'visible');
+    const active = visible.length ? visible : [];
+    const lag = active.map(s => s.eventLoopLagMs);
+    const longMs = active.reduce((a, s) => a + s.longTaskMsDelta, 0);
+    const windowSec = Math.max(intervalMs / 1000, active.length * intervalMs / 1000);
+    const heaps = active.map(s => s.heapUsedMb).filter(Number.isFinite);
+    const healthCounts = { stable: 0, watch: 0, stressed: 0, background: 0 };
+    for (const sample of samples) healthCounts[sample.health]++;
+    return {
+      samples: samples.length,
+      visibleSamples: visible.length,
+      backgroundSamples: samples.length - visible.length,
+      windowSec: Number((visible.length ? windowSec : 0).toFixed(1)),
+      eventLoopLagP50Ms: percentile(lag, 0.50),
+      eventLoopLagP95Ms: percentile(lag, 0.95),
+      eventLoopLagMaxMs: percentile(lag, 1.0),
+      longTaskCount: active.reduce((a, s) => a + s.longTaskCountDelta, 0),
+      longTaskMsPerSec: visible.length ? Number((longMs / windowSec).toFixed(2)) : 0,
+      audioUnderruns: active.reduce((a, s) => a + s.audioUnderrunsDelta, 0),
+      audioOverruns: active.reduce((a, s) => a + s.audioOverrunsDelta, 0),
+      audioDroppedMs: Number(active.reduce((a, s) => a + s.audioDroppedMsDelta, 0).toFixed(2)),
+      workerFailures: active.reduce((a, s) => a + s.workerFailuresDelta, 0),
+      heapUsedMbFirst: heaps.length ? heaps[0] : null,
+      heapUsedMbLast: heaps.length ? heaps[heaps.length - 1] : null,
+      heapGrowthMb: heaps.length > 1 ? Number((heaps[heaps.length - 1] - heaps[0]).toFixed(2)) : null,
+      healthCounts
+    };
+  }
+
+  function report(includeSamples = false) {
+    const endMs = running ? webRxNowMs() : (stoppedAtMs || webRxNowMs());
+    const durationSec = startedAtMs ? Math.max(0, (endMs - startedAtMs) / 1000) : 0;
+    const avgLag = session && session.samples ? session.eventLoopLagMsTotal / session.samples : 0;
+    const heapGrowth = session && session.heapStartMb != null && session.heapLastMb != null
+      ? session.heapLastMb - session.heapStartMb : null;
+    const result = {
+      phase: 'K',
+      running,
+      startedAt: startedAtMs ? new Date(Date.now() - Math.max(0, webRxNowMs() - startedAtMs)).toISOString() : null,
+      durationSec: Number(durationSec.toFixed(1)),
+      sampleIntervalMs: intervalMs,
+      rolling: summarizeRolling(),
+      session: session ? {
+        samples: session.samples,
+        eventLoopLagMsAvg: Number(avgLag.toFixed(2)),
+        eventLoopLagMsMax: Number(session.eventLoopLagMsMax.toFixed(2)),
+        longTaskCount: session.longTaskCount,
+        longTaskMs: Number(session.longTaskMs.toFixed(2)),
+        longTaskMsMax: Number(session.longTaskMsMax.toFixed(2)),
+        audioUnderruns: session.audioUnderruns,
+        audioOverruns: session.audioOverruns,
+        audioDroppedMs: Number(session.audioDroppedMs.toFixed(2)),
+        workerFailures: session.workerFailures,
+        healthCounts: { ...session.health },
+        heapStartMb: session.heapStartMb,
+        heapLastMb: session.heapLastMb,
+        heapMaxMb: session.heapMaxMb,
+        heapGrowthMb: heapGrowth == null ? null : Number(heapGrowth.toFixed(2)),
+        heapGrowthMbPerHour: heapGrowth == null || durationSec < 60 ? null : Number((heapGrowth / (durationSec / 3600)).toFixed(2))
+      } : null,
+      runtimePolicy: RuntimePerformancePolicy.snapshot(),
+      diagnostics: WebRxDiagnostics.snapshot()
+    };
+    if (includeSamples) result.rollingSamples = samples.slice();
+    return result;
+  }
+
+  function reset() {
+    samples = [];
+    session = newSession();
+    longTaskTotalCount = 0;
+    longTaskTotalMs = 0;
+    longTaskMaxMs = 0;
+    longTaskCountAtSample = 0;
+    longTaskMsAtSample = 0;
+    previousAudio = null;
+    previousFailures = null;
+    startedAtMs = running ? webRxNowMs() : 0;
+    stoppedAtMs = 0;
+    nextExpectedMs = webRxNowMs() + intervalMs;
+    return report(false);
+  }
+
+  function start(options = {}) {
+    if (running) return report(false);
+    const requestedInterval = Number(options.sampleIntervalMs);
+    intervalMs = Number.isFinite(requestedInterval) ? Math.max(500, Math.min(10000, Math.round(requestedInterval))) : DEFAULT_INTERVAL_MS;
+    const requestedLimit = Number(options.rollingSamples);
+    rollingLimit = Number.isFinite(requestedLimit) ? Math.max(30, Math.min(3600, Math.round(requestedLimit))) : DEFAULT_ROLLING_SAMPLES;
+    running = true;
+    session = newSession();
+    samples = [];
+    startedAtMs = webRxNowMs();
+    stoppedAtMs = 0;
+    nextExpectedMs = startedAtMs + intervalMs;
+    previousAudio = null;
+    previousFailures = null;
+    longTaskCountAtSample = longTaskTotalCount;
+    longTaskMsAtSample = longTaskTotalMs;
+    startLongTaskObserver();
+    timer = setInterval(capture, intervalMs);
+    try { localStorage.setItem('webrxProductionProfiler', '1'); } catch (_) {}
+    return report(false);
+  }
+
+  function stop() {
+    if (!running) return report(false);
+    running = false;
+    stoppedAtMs = webRxNowMs();
+    if (timer) clearInterval(timer);
+    timer = null;
+    stopLongTaskObserver();
+    try { localStorage.setItem('webrxProductionProfiler', '0'); } catch (_) {}
+    return report(false);
+  }
+
+  function download(filename = 'webrx-production-soak.json') {
+    const payload = JSON.stringify(report(true), null, 2);
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    return payload.length;
+  }
+
+  // Profiler is on by default because it samples at only 0.5 Hz and keeps a
+  // bounded ring. Set localStorage webrxProductionProfiler=0 to disable it.
+  let autoStart = true;
+  try { autoStart = localStorage.getItem('webrxProductionProfiler') !== '0'; } catch (_) {}
+  session = newSession();
+  if (autoStart) setTimeout(() => start(), 0);
+
+  return { start, stop, reset, report, download, capture, isRunning: () => running };
+})();
+window.WebRxProductionProfiler = WebRxProductionProfiler;
+window.startProductionSoak = (options) => WebRxProductionProfiler.start(options);
+window.stopProductionSoak = () => WebRxProductionProfiler.stop();
+window.getProductionSoakReport = (includeSamples = false) => WebRxProductionProfiler.report(includeSamples);
+window.downloadProductionSoakReport = (filename) => WebRxProductionProfiler.download(filename);
+
+// === ADAPTIVE PARAMETER TUNER (Phase K) ===
+//
+// Default mode is observe-only: it publishes a recommendation but does not
+// modify runtime parameters. Auto mode may only alter browser presentation
+// cadence and the bounded audio queue; it never retunes RF or changes DSP mode.
+const WebRxAdaptiveTuner = (() => {
+  let mode = 'observe';
+  let lastRecommendation = 'balanced';
+  let lastReason = 'bootstrap';
+  let lastEvaluationAtMs = 0;
+  let lastPolicyChangeAtMs = 0;
+  let lastAudioChangeAtMs = 0;
+  let stableSinceMs = 0;
+  const EVALUATE_MS = 10000;
+  const POLICY_COOLDOWN_MS = 15000;
+  const AUDIO_COOLDOWN_MS = 30000;
+  const MIN_STABLE_SAMPLES = 10;
+
+  try {
+    const saved = localStorage.getItem('webrxAdaptivePerformanceMode');
+    if (saved === 'off' || saved === 'observe' || saved === 'auto') mode = saved;
+  } catch (_) {}
+
+  function choose(report) {
+    const r = report && report.rolling ? report.rolling : null;
+    if (!r || r.visibleSamples < 3) return { profile: 'balanced', reason: 'warming-up', stable: false, audioStress: false };
+    const audioStress = r.audioUnderruns > 0 || r.audioOverruns > 0 || r.audioDroppedMs > 0;
+    const stressed = r.workerFailures > 0 || audioStress ||
+      (Number(r.eventLoopLagP95Ms) || 0) >= 40 ||
+      (Number(r.longTaskMsPerSec) || 0) >= 120;
+    if (stressed) {
+      const reasons = [];
+      if (audioStress) reasons.push('audio');
+      if (r.workerFailures > 0) reasons.push('worker-failure');
+      if ((Number(r.eventLoopLagP95Ms) || 0) >= 40) reasons.push('event-loop');
+      if ((Number(r.longTaskMsPerSec) || 0) >= 120) reasons.push('long-task');
+      return { profile: 'performance', reason: reasons.join('+') || 'runtime-stress', stable: false, audioStress };
+    }
+    const stable = r.visibleSamples >= MIN_STABLE_SAMPLES &&
+      (Number(r.eventLoopLagP95Ms) || 0) < 12 &&
+      (Number(r.longTaskMsPerSec) || 0) < 25 &&
+      r.audioUnderruns === 0 && r.audioOverruns === 0 && r.workerFailures === 0;
+    return { profile: 'balanced', reason: stable ? 'stable' : 'normal', stable, audioStress: false };
+  }
+
+  function maybeTuneAudio(decision, now) {
+    if (!audioEngine || typeof audioEngine.getLatencySnapshot !== 'function' ||
+        typeof audioEngine.configureLatencyProfile !== 'function') return;
+    const audio = audioEngine.getLatencySnapshot();
+    if (!audio || audio.contextState === 'unavailable') return;
+    const current = Number(audio.targetQueueMs) || 40;
+
+    if (decision.audioStress && now - lastAudioChangeAtMs >= AUDIO_COOLDOWN_MS && current < 80) {
+      const target = Math.min(80, current + 10);
+      audioEngine.configureLatencyProfile({
+        targetQueueMs: target,
+        startQueueMs: target,
+        hardMaxQueueMs: Math.max(120, target * 3)
+      });
+      lastAudioChangeAtMs = now;
+      return;
+    }
+
+    if (decision.stable) {
+      if (!stableSinceMs) stableSinceMs = now;
+      if (current > 40 && now - stableSinceMs >= 60000 && now - lastAudioChangeAtMs >= AUDIO_COOLDOWN_MS) {
+        const target = Math.max(40, current - 10);
+        audioEngine.configureLatencyProfile({
+          targetQueueMs: target,
+          startQueueMs: target,
+          hardMaxQueueMs: Math.max(120, target * 3)
+        });
+        lastAudioChangeAtMs = now;
+      }
+    } else {
+      stableSinceMs = 0;
+    }
+  }
+
+  function evaluate() {
+    lastEvaluationAtMs = webRxNowMs();
+    const report = WebRxProductionProfiler.report(false);
+    const decision = choose(report);
+    lastRecommendation = decision.profile;
+    lastReason = decision.reason;
+
+    if (mode === 'auto') {
+      const current = RuntimePerformancePolicy.snapshot();
+      if (current.profile !== decision.profile && lastEvaluationAtMs - lastPolicyChangeAtMs >= POLICY_COOLDOWN_MS) {
+        RuntimePerformancePolicy.applyProfile(decision.profile, 'adaptive');
+        lastPolicyChangeAtMs = lastEvaluationAtMs;
+      }
+      maybeTuneAudio(decision, lastEvaluationAtMs);
+    }
+    return snapshot();
+  }
+
+  function setMode(next) {
+    const normalized = String(next || '').toLowerCase();
+    if (normalized !== 'off' && normalized !== 'observe' && normalized !== 'auto') {
+      throw new Error("Adaptive performance mode must be 'off', 'observe', or 'auto'");
+    }
+    mode = normalized;
+    try { localStorage.setItem('webrxAdaptivePerformanceMode', mode); } catch (_) {}
+    if (mode === 'off') {
+      stableSinceMs = 0;
+      return snapshot();
+    }
+    if (!WebRxProductionProfiler.isRunning()) WebRxProductionProfiler.start();
+    return evaluate();
+  }
+
+  function snapshot() {
+    return {
+      mode,
+      recommendation: lastRecommendation,
+      reason: lastReason,
+      lastEvaluationAgoMs: lastEvaluationAtMs ? Number((webRxNowMs() - lastEvaluationAtMs).toFixed(0)) : null,
+      lastPolicyChangeAgoMs: lastPolicyChangeAtMs ? Number((webRxNowMs() - lastPolicyChangeAtMs).toFixed(0)) : null,
+      lastAudioChangeAgoMs: lastAudioChangeAtMs ? Number((webRxNowMs() - lastAudioChangeAtMs).toFixed(0)) : null,
+      runtimePolicy: RuntimePerformancePolicy.snapshot(),
+      audio: audioEngine && typeof audioEngine.getLatencySnapshot === 'function' ? audioEngine.getLatencySnapshot() : null
+    };
+  }
+
+  setInterval(() => {
+    if (mode !== 'off' && WebRxProductionProfiler.isRunning()) evaluate();
+  }, EVALUATE_MS);
+
+  return { setMode, evaluate, snapshot };
+})();
+window.WebRxAdaptiveTuner = WebRxAdaptiveTuner;
+window.setAdaptivePerformanceMode = (mode) => WebRxAdaptiveTuner.setMode(mode);
+window.getAdaptivePerformanceSnapshot = () => WebRxAdaptiveTuner.snapshot();
+
+// === PRODUCTION QUALIFICATION / CANDIDATE FREEZE (Phase L) ===
+//
+// Phase K tells us how the browser behaved. Phase L turns those measurements
+// into a repeatable qualification workflow without inventing final production
+// defaults before hardware evidence exists. A qualification run snapshots the
+// active presentation/audio parameters, verifies that they did not drift during
+// the soak, evaluates bounded engineering gates, and exports the exact candidate
+// configuration together with its evidence.
+const WebRxProductionQualification = (() => {
+  const MILESTONES_HOURS = Object.freeze([6, 12, 24, 48]);
+  const DEFAULT_TARGET_HOURS = 6;
+  const CHECK_INTERVAL_MS = 15000;
+
+  // Initial qualification gates are deliberately configurable. They are not
+  // claimed as universal RF-product limits; they provide a repeatable first
+  // production screen until real hardware soak data lets us freeze tighter
+  // project-specific limits in a later revision.
+  const defaultGates = Object.freeze({
+    workerFailures: Object.freeze({ passMax: 0, failAbove: 0 }),
+    audioUnderrunsPerHour: Object.freeze({ passMax: 1.0, failAbove: 6.0 }),
+    audioOverrunsPerHour: Object.freeze({ passMax: 1.0, failAbove: 6.0 }),
+    audioDroppedMsPerHour: Object.freeze({ passMax: 100.0, failAbove: 1000.0 }),
+    stressedSamplesPct: Object.freeze({ passMax: 0.5, failAbove: 2.0 }),
+    nonStableSamplesPct: Object.freeze({ passMax: 5.0, failAbove: 15.0 }),
+    eventLoopLagAvgMs: Object.freeze({ passMax: 8.0, failAbove: 20.0 }),
+    eventLoopLagMaxMs: Object.freeze({ passMax: 150.0, failAbove: 500.0 }),
+    heapGrowthMbPerHour: Object.freeze({ passMax: 5.0, failAbove: 20.0, minHours: 1.0 })
+  });
+
+  let gates = clone(defaultGates);
+  let active = false;
+  let targetHours = DEFAULT_TARGET_HOURS;
+  let startedAtWallMs = 0;
+  let candidateAtStart = null;
+  let candidateFingerprintAtStart = null;
+  let lastStatus = null;
+  let timer = null;
+  let runId = null;
+  let startNotes = '';
+
+  function clone(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function finite(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function clamp(value, min, max, fallback) {
+    return Math.max(min, Math.min(max, finite(value, fallback)));
+  }
+
+  function stableStringify(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+    return '{' + Object.keys(value).sort().map(key =>
+      JSON.stringify(key) + ':' + stableStringify(value[key])
+    ).join(',') + '}';
+  }
+
+  // Small deterministic fingerprint: it is a drift detector, not a security hash.
+  function fingerprint(value) {
+    const text = stableStringify(value);
+    let h1 = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+      h1 ^= text.charCodeAt(i);
+      h1 = Math.imul(h1, 0x01000193) >>> 0;
+    }
+    return h1.toString(16).padStart(8, '0');
+  }
+
+  function safeSnapshot(fn, fallback = null) {
+    try { return typeof fn === 'function' ? fn() : fallback; }
+    catch (_) { return fallback; }
+  }
+
+  function candidateConfig() {
+    const audio = safeSnapshot(() => audioEngine && audioEngine.getLatencySnapshot(), null);
+    const intensity = safeSnapshot(() => WaterfallIntensity.snapshot(), null);
+    const waterfall = safeSnapshot(() => WaterfallEngine.snapshot(), null);
+    const realtime = safeSnapshot(() => RealtimeDspWorker.snapshot(), null);
+    const tuning = safeSnapshot(() => FrequencyController.getSchedulerSnapshot(), null);
+    const adaptive = safeSnapshot(() => WebRxAdaptiveTuner.snapshot(), null);
+    const wsUrl = (() => {
+      try { return ws && typeof ws.url === 'string' ? ws.url : null; }
+      catch (_) { return null; }
+    })();
+
+    return {
+      schema: 'webrx-production-candidate-v1',
+      runtimePolicy: RuntimePerformancePolicy.snapshot(),
+      audioLatency: audio ? {
+        targetQueueMs: audio.targetQueueMs,
+        startQueueMs: audio.startQueueMs,
+        hardMaxQueueMs: audio.hardMaxQueueMs
+      } : null,
+      waterfallIntensity: intensity ? {
+        mode: intensity.mode,
+        manualMinDb: intensity.manualMinDb,
+        manualMaxDb: intensity.manualMaxDb,
+        config: clone(intensity.config || {})
+      } : null,
+      workers: {
+        waterfall: waterfall && waterfall.worker ? {
+          supported: !!waterfall.worker.supported,
+          preferred: waterfall.worker.preferred !== false,
+          disabled: !!waterfall.worker.disabled
+        } : null,
+        realtimeDsp: realtime ? {
+          supported: !!realtime.supported,
+          preferred: realtime.preferred !== false,
+          disabled: !!realtime.disabled
+        } : null
+      },
+      tuningScheduler: tuning ? {
+        maxSendHz: tuning.maxSendHz,
+        intervalMs: tuning.intervalMs
+      } : null,
+      adaptiveMode: adaptive ? adaptive.mode : null,
+      transport: {
+        astraRxWebSocket: wsUrl,
+        secureContext: !!window.isSecureContext
+      }
+    };
+  }
+
+  function candidateSnapshot() {
+    const config = candidateConfig();
+    return {
+      capturedAt: new Date().toISOString(),
+      fingerprint: fingerprint(config),
+      config
+    };
+  }
+
+  function sanitizeGates(next) {
+    const result = clone(gates);
+    if (!next || typeof next !== 'object') return result;
+    for (const key of Object.keys(result)) {
+      if (!next[key] || typeof next[key] !== 'object') continue;
+      const src = next[key];
+      result[key].passMax = Math.max(0, finite(src.passMax, result[key].passMax));
+      result[key].failAbove = Math.max(result[key].passMax, finite(src.failAbove, result[key].failAbove));
+      if ('minHours' in result[key]) result[key].minHours = Math.max(0, finite(src.minHours, result[key].minHours));
+    }
+    return result;
+  }
+
+  function configureGates(next) {
+    gates = sanitizeGates(next);
+    return clone(gates);
+  }
+
+  function resetGates() {
+    gates = clone(defaultGates);
+    return clone(gates);
+  }
+
+  function activeHoursFromReport(report) {
+    if (!report || !report.session || !report.session.healthCounts) return 0;
+    const h = report.session.healthCounts;
+    const visibleSamples = finite(h.stable) + finite(h.watch) + finite(h.stressed);
+    return visibleSamples * finite(report.sampleIntervalMs, 0) / 3600000;
+  }
+
+  function ratePerHour(total, activeHours) {
+    if (activeHours <= 0) return 0;
+    return finite(total) / activeHours;
+  }
+
+  function metricStatus(value, rule, applicable = true) {
+    if (!applicable || value === null || !Number.isFinite(Number(value))) {
+      return { status: 'NA', value: value ?? null, passMax: rule.passMax, failAbove: rule.failAbove };
+    }
+    const n = Number(value);
+    const status = n <= rule.passMax ? 'PASS' : (n > rule.failAbove ? 'FAIL' : 'WATCH');
+    return { status, value: Number(n.toFixed(3)), passMax: rule.passMax, failAbove: rule.failAbove };
+  }
+
+  function evaluateMetrics(report) {
+    const s = report && report.session ? report.session : {};
+    const h = s.healthCounts || { stable: 0, watch: 0, stressed: 0, background: 0 };
+    const visibleSamples = finite(h.stable) + finite(h.watch) + finite(h.stressed);
+    const activeHours = activeHoursFromReport(report);
+    const stressedPct = visibleSamples > 0 ? finite(h.stressed) * 100 / visibleSamples : 0;
+    const nonStablePct = visibleSamples > 0 ? (finite(h.watch) + finite(h.stressed)) * 100 / visibleSamples : 0;
+    const heapRate = s.heapGrowthMbPerHour == null ? null : Number(s.heapGrowthMbPerHour);
+
+    const metrics = {
+      workerFailures: metricStatus(finite(s.workerFailures), gates.workerFailures),
+      audioUnderrunsPerHour: metricStatus(ratePerHour(s.audioUnderruns, activeHours), gates.audioUnderrunsPerHour, activeHours > 0),
+      audioOverrunsPerHour: metricStatus(ratePerHour(s.audioOverruns, activeHours), gates.audioOverrunsPerHour, activeHours > 0),
+      audioDroppedMsPerHour: metricStatus(ratePerHour(s.audioDroppedMs, activeHours), gates.audioDroppedMsPerHour, activeHours > 0),
+      stressedSamplesPct: metricStatus(stressedPct, gates.stressedSamplesPct, visibleSamples > 0),
+      nonStableSamplesPct: metricStatus(nonStablePct, gates.nonStableSamplesPct, visibleSamples > 0),
+      eventLoopLagAvgMs: metricStatus(s.eventLoopLagMsAvg, gates.eventLoopLagAvgMs, visibleSamples > 0),
+      eventLoopLagMaxMs: metricStatus(s.eventLoopLagMsMax, gates.eventLoopLagMaxMs, visibleSamples > 0),
+      heapGrowthMbPerHour: metricStatus(
+        heapRate,
+        gates.heapGrowthMbPerHour,
+        activeHours >= finite(gates.heapGrowthMbPerHour.minHours, 1) && heapRate !== null
+      )
+    };
+
+    return { activeHours, visibleSamples, stressedPct, nonStablePct, metrics };
+  }
+
+  function aggregateStatus(metrics, configDrift, ready) {
+    if (!ready) return 'NOT_READY';
+    if (configDrift) return 'FAIL';
+    const statuses = Object.values(metrics).map(m => m.status);
+    if (statuses.includes('FAIL')) return 'FAIL';
+    if (statuses.includes('WATCH')) return 'WATCH';
+    return 'PASS';
+  }
+
+  function milestoneStatuses(activeHours, metrics, configDrift) {
+    const result = {};
+    for (const hours of MILESTONES_HOURS) {
+      const ready = activeHours >= hours;
+      result[`${hours}h`] = {
+        requiredHours: hours,
+        ready,
+        status: aggregateStatus(metrics, configDrift, ready)
+      };
+    }
+    return result;
+  }
+
+  function status() {
+    const report = WebRxProductionProfiler.report(false);
+    const evaluation = evaluateMetrics(report);
+    const currentCandidate = candidateSnapshot();
+    const configDrift = !!candidateFingerprintAtStart && currentCandidate.fingerprint !== candidateFingerprintAtStart;
+    const progressPct = targetHours > 0 ? Math.min(100, evaluation.activeHours * 100 / targetHours) : 0;
+    const ready = evaluation.activeHours >= targetHours;
+    const overall = aggregateStatus(evaluation.metrics, configDrift, ready);
+    const result = {
+      phase: 'L',
+      runId,
+      active,
+      startedAt: startedAtWallMs ? new Date(startedAtWallMs).toISOString() : null,
+      targetHours,
+      activeHours: Number(evaluation.activeHours.toFixed(3)),
+      progressPct: Number(progressPct.toFixed(1)),
+      status: overall,
+      configDrift,
+      candidateFingerprintAtStart,
+      candidateFingerprintNow: currentCandidate.fingerprint,
+      notes: startNotes,
+      milestones: milestoneStatuses(evaluation.activeHours, evaluation.metrics, configDrift),
+      metrics: evaluation.metrics,
+      profiler: {
+        running: !!report.running,
+        wallDurationSec: report.durationSec,
+        sampleIntervalMs: report.sampleIntervalMs,
+        healthCounts: report.session ? report.session.healthCounts : null,
+        heapGrowthMb: report.session ? report.session.heapGrowthMb : null,
+        heapGrowthMbPerHour: report.session ? report.session.heapGrowthMbPerHour : null
+      },
+      candidateAtStart: candidateAtStart ? clone(candidateAtStart) : null,
+      candidateNow: currentCandidate
+    };
+    lastStatus = result;
+    return result;
+  }
+
+  function start(options = {}) {
+    targetHours = clamp(options.targetHours, 0.05, 168, DEFAULT_TARGET_HOURS);
+    startNotes = typeof options.notes === 'string' ? options.notes : '';
+    const resetProfiler = options.resetProfiler !== false;
+    const forceObserve = options.forceObserve !== false;
+
+    if (!WebRxProductionProfiler.isRunning()) WebRxProductionProfiler.start();
+    if (resetProfiler) WebRxProductionProfiler.reset();
+    if (forceObserve && WebRxAdaptiveTuner.snapshot().mode !== 'observe') {
+      WebRxAdaptiveTuner.setMode('observe');
+    }
+
+    candidateAtStart = candidateSnapshot();
+    candidateFingerprintAtStart = candidateAtStart.fingerprint;
+    startedAtWallMs = Date.now();
+    runId = `L-${startedAtWallMs.toString(36)}-${candidateFingerprintAtStart}`;
+    active = true;
+    if (timer) clearInterval(timer);
+    timer = setInterval(() => {
+      if (!active) return;
+      const s = status();
+      if (s.progressPct >= 100 && (s.status === 'PASS' || s.status === 'WATCH' || s.status === 'FAIL')) {
+        // Do not auto-stop the profiler: continuing beyond 6/12/24 h is useful.
+        lastStatus = s;
+      }
+    }, CHECK_INTERVAL_MS);
+    return status();
+  }
+
+  function stop() {
+    const result = status();
+    active = false;
+    if (timer) clearInterval(timer);
+    timer = null;
+    return { ...result, active: false };
+  }
+
+  function reset() {
+    active = false;
+    if (timer) clearInterval(timer);
+    timer = null;
+    targetHours = DEFAULT_TARGET_HOURS;
+    startedAtWallMs = 0;
+    candidateAtStart = null;
+    candidateFingerprintAtStart = null;
+    lastStatus = null;
+    runId = null;
+    startNotes = '';
+    return status();
+  }
+
+  function buildCandidateArtifact(includeRollingSamples = true) {
+    const qualification = status();
+    return {
+      schema: 'webrx-production-qualification-v1',
+      exportedAt: new Date().toISOString(),
+      qualification,
+      gates: clone(gates),
+      profilerReport: WebRxProductionProfiler.report(!!includeRollingSamples),
+      adaptive: WebRxAdaptiveTuner.snapshot(),
+      candidate: candidateSnapshot(),
+      environment: {
+        href: typeof location !== 'undefined' ? location.href : null,
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
+        hardwareConcurrency: typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : null,
+        deviceMemoryGb: typeof navigator !== 'undefined' && navigator.deviceMemory ? navigator.deviceMemory : null,
+        secureContext: !!window.isSecureContext
+      }
+    };
+  }
+
+  function download(filename = null) {
+    const payload = JSON.stringify(buildCandidateArtifact(true), null, 2);
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const statusNow = lastStatus || status();
+    a.download = filename || `webrx-phaseL-${statusNow.targetHours}h-${String(statusNow.status).toLowerCase()}-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    return payload.length;
+  }
+
+  function candidate() {
+    return candidateSnapshot();
+  }
+
+  return {
+    start,
+    stop,
+    reset,
+    status,
+    candidate,
+    buildCandidateArtifact,
+    download,
+    configureGates,
+    resetGates,
+    getGates: () => clone(gates),
+    isActive: () => active
+  };
+})();
+window.WebRxProductionQualification = WebRxProductionQualification;
+window.startProductionQualification = (options) => WebRxProductionQualification.start(options || {});
+window.stopProductionQualification = () => WebRxProductionQualification.stop();
+window.resetProductionQualification = () => WebRxProductionQualification.reset();
+window.getProductionQualificationStatus = () => WebRxProductionQualification.status();
+window.captureProductionCandidate = () => WebRxProductionQualification.candidate();
+window.downloadProductionQualificationReport = (filename) => WebRxProductionQualification.download(filename);
+window.configureProductionQualificationGates = (options) => WebRxProductionQualification.configureGates(options || {});
+window.resetProductionQualificationGates = () => WebRxProductionQualification.resetGates();
+
+// === REALTIME DSP WORKER (Phase J.2) ===
+//
+// Keep the expensive full-history waterfall projection on its dedicated Phase J
+// worker. A second worker instance handles short realtime jobs (dense spectrum
+// envelope reduction and waterfall percentile statistics) so a long history
+// rebuild can never head-of-line block the live spectrum path.
+const RealtimeDspWorker = (() => {
+  const WORKER_URL = 'static/lib/WebRxDspWorker.js';
+  let worker = null;
+  let preferred = true;
+  let disabled = false;
+  let activeJob = null;
+  let pendingSpectrum = null;
+  let pendingStats = null;
+  let serial = 0;
+
+  try {
+    preferred = localStorage.getItem('webrxRealtimeDspWorker') !== '0';
+  } catch (_) {}
+
+  function supported() {
+    return preferred && !disabled && typeof Worker === 'function';
+  }
+
+  function markDiscard(kind) {
+    if (kind === 'spectrum') WebRxDiagnostics.markSpectrumWorkerDiscard();
+    else if (kind === 'stats') WebRxDiagnostics.markWaterfallStatsWorkerDiscard();
+  }
+
+  function markFailure(kind) {
+    if (kind === 'spectrum') WebRxDiagnostics.markSpectrumWorkerFailure();
+    else if (kind === 'stats') WebRxDiagnostics.markWaterfallStatsWorkerFailure();
+  }
+
+  function terminate(disable = false) {
+    if (worker) {
+      try { worker.terminate(); } catch (_) {}
+    }
+    worker = null;
+    activeJob = null;
+    pendingSpectrum = null;
+    pendingStats = null;
+    if (disable) disabled = true;
+  }
+
+  function ensureWorker() {
+    if (!supported()) return null;
+    if (worker) return worker;
+    try {
+      worker = new Worker(WORKER_URL);
+      worker.onmessage = handleMessage;
+      worker.onerror = (event) => {
+        console.warn('[WEBRX-WORKER] Realtime DSP worker failed; using main-thread fallback.',
+          event && event.message ? event.message : event);
+        if (activeJob) markFailure(activeJob.kind);
+        terminate(true);
+      };
+      console.info('[WEBRX-WORKER] Realtime DSP worker enabled:', WORKER_URL);
+      return worker;
+    } catch (error) {
+      console.warn('[WEBRX-WORKER] Unable to start realtime DSP worker; using main-thread fallback.', error);
+      disabled = true;
+      return null;
+    }
+  }
+
+  function pump() {
+    if (activeJob || !ensureWorker()) return;
+    // Spectrum presentation has priority over low-rate auto-intensity statistics.
+    const job = pendingSpectrum || pendingStats;
+    if (!job) return;
+    if (job === pendingSpectrum) pendingSpectrum = null;
+    else pendingStats = null;
+    activeJob = job;
+
+    try {
+      if (job.kind === 'spectrum') {
+        WebRxDiagnostics.markSpectrumWorkerRequest(job.copiedBytes);
+      } else {
+        WebRxDiagnostics.markWaterfallStatsWorkerRequest(job.copiedBytes);
+      }
+      worker.postMessage(job.message, job.transfer);
+    } catch (error) {
+      console.warn('[WEBRX-WORKER] Failed to queue realtime DSP task; using fallback.', error);
+      markFailure(job.kind);
+      activeJob = null;
+      disabled = true;
+      terminate(true);
+      if (typeof job.onFailure === 'function') job.onFailure(error);
+    }
+  }
+
+  function handleMessage(event) {
+    const message = event && event.data ? event.data : {};
+    const job = activeJob;
+    if (!job || message.requestId !== job.requestId) {
+      if (message.type === 'spectrum-reduced') markDiscard('spectrum');
+      else if (message.type === 'waterfall-stats') markDiscard('stats');
+      return;
+    }
+
+    activeJob = null;
+    if (message.type === 'worker-error') {
+      markFailure(job.kind);
+      if (typeof job.onFailure === 'function') job.onFailure(new Error(message.error || 'worker error'));
+      pump();
+      return;
+    }
+
+    if (job.kind === 'spectrum') {
+      WebRxDiagnostics.markSpectrumWorkerCompletion(message.elapsedMs);
+    } else {
+      WebRxDiagnostics.markWaterfallStatsWorkerCompletion(message.elapsedMs);
+    }
+
+    let accepted = true;
+    if (typeof job.onResult === 'function') {
+      try { accepted = job.onResult(message) !== false; }
+      catch (error) {
+        accepted = false;
+        console.warn('[WEBRX-WORKER] Realtime DSP result handler failed.', error);
+      }
+    }
+    if (!accepted) markDiscard(job.kind);
+    pump();
+  }
+
+  function requestSpectrum(options) {
+    if (!ensureWorker()) return false;
+    const data = options && options.data;
+    const width = Math.max(1, options && options.width | 0);
+    const start = Math.max(0, Math.min(data ? data.length - 1 : 0, options && options.start | 0));
+    const end = Math.max(start + 1, Math.min(data ? data.length : 0, options && options.end | 0));
+    if (!data || data.length <= 0 || end <= start) return false;
+
+    const trace = new Float32Array(end - start);
+    trace.set(data.subarray ? data.subarray(start, end) : Array.from(data).slice(start, end));
+    let maxHold = null;
+    if (options.maxHold && options.maxHold.length >= end) {
+      maxHold = new Float32Array(end - start);
+      if (options.maxHold instanceof Float32Array) maxHold.set(options.maxHold.subarray(start, end));
+      else {
+        for (let i = start; i < end; i++) maxHold[i - start] = Number(options.maxHold[i]);
+      }
+    }
+
+    const requestId = ++serial;
+    const transfer = [trace.buffer];
+    if (maxHold) transfer.push(maxHold.buffer);
+    const job = {
+      kind: 'spectrum',
+      requestId,
+      copiedBytes: trace.byteLength + (maxHold ? maxHold.byteLength : 0),
+      message: {
+        type: 'spectrum-reduce',
+        requestId,
+        sourceRevision: options.sourceRevision,
+        viewKey: options.viewKey,
+        width,
+        trace: trace.buffer,
+        maxHold: maxHold ? maxHold.buffer : null
+      },
+      transfer,
+      onResult: options.onResult,
+      onFailure: options.onFailure
+    };
+
+    if (pendingSpectrum) markDiscard('spectrum');
+    pendingSpectrum = job;
+    pump();
+    return true;
+  }
+
+  function requestWaterfallStats(options) {
+    if (!ensureWorker()) return false;
+    const line = options && options.line;
+    if (!line || line.length <= 0) return false;
+    const start = Math.max(0, Math.min(line.length - 1, options.start | 0));
+    const end = Math.max(start + 1, Math.min(line.length, options.end | 0));
+    if (end <= start) return false;
+
+    // Copy only the currently visible RF span. TypedArray#set is implemented
+    // natively and is cheaper than building the histogram on the UI thread.
+    const visible = new Float32Array(end - start);
+    visible.set(line.subarray ? line.subarray(start, end) : Array.from(line).slice(start, end));
+    const requestId = ++serial;
+    const job = {
+      kind: 'stats',
+      requestId,
+      copiedBytes: visible.byteLength,
+      message: {
+        type: 'waterfall-stats',
+        requestId,
+        stateRevision: options.stateRevision,
+        sampleBudget: options.sampleBudget,
+        noisePercentile: options.noisePercentile,
+        signalPercentile: options.signalPercentile,
+        histMinDb: options.histMinDb,
+        histMaxDb: options.histMaxDb,
+        line: visible.buffer
+      },
+      transfer: [visible.buffer],
+      onResult: options.onResult,
+      onFailure: options.onFailure
+    };
+
+    if (pendingStats) markDiscard('stats');
+    pendingStats = job;
+    pump();
+    return true;
+  }
+
+  function setEnabled(enabled) {
+    preferred = !!enabled;
+    try { localStorage.setItem('webrxRealtimeDspWorker', preferred ? '1' : '0'); } catch (_) {}
+    if (!preferred) terminate(false);
+    else disabled = false;
+    return snapshot();
+  }
+
+  function snapshot() {
+    return {
+      supported: typeof Worker === 'function',
+      preferred,
+      disabled,
+      active: !!worker,
+      busy: !!activeJob,
+      activeKind: activeJob ? activeJob.kind : '',
+      pendingSpectrum: !!pendingSpectrum,
+      pendingStats: !!pendingStats,
+      requestSerial: serial
+    };
+  }
+
+  return { requestSpectrum, requestWaterfallStats, setEnabled, snapshot };
+})();
+window.RealtimeDspWorker = RealtimeDspWorker;
+window.setRealtimeDspWorkerEnabled = (enabled) => RealtimeDspWorker.setEnabled(enabled);
+
+// Phase G: protect the latest local tuning intent from periodic/stale server
+// config frames while the server is acknowledging a command. This is NOT a
+// second source of truth: the guard expires quickly and server state becomes
+// authoritative again if the requested value is not acknowledged.
+const TuningStateGuard = (() => {
+  const ACK_TOLERANCE_HZ = 2;
+  const HOLD_MS = 1200;
+  let generation = 0;
+  let pending = null;
+
+  function near(a, b) {
+    return Number.isFinite(Number(a)) && Number.isFinite(Number(b)) &&
+      Math.abs(Number(a) - Number(b)) <= ACK_TOLERANCE_HZ;
+  }
+
+  function expireIfNeeded(now = webRxNowMs()) {
+    if (pending && now >= pending.expiresMs) pending = null;
+  }
+
+  function noteIntent(kind, centerHz, offsetHz, reason = "ui.tune") {
+    const now = webRxNowMs();
+    generation++;
+    pending = {
+      generation,
+      kind,
+      centerHz: Number(centerHz),
+      offsetHz: Number(offsetHz),
+      reason,
+      createdMs: now,
+      sentMs: 0,
+      expiresMs: now + HOLD_MS
+    };
+    WebRxDiagnostics.markTuningIntent();
+    return generation;
+  }
+
+  function markSent(intentGeneration) {
+    expireIfNeeded();
+    if (!pending || pending.generation !== intentGeneration) return;
+    const now = webRxNowMs();
+    pending.sentMs = now;
+    pending.expiresMs = now + HOLD_MS;
+  }
+
+  function filterServerConfig(config) {
+    if (!config || typeof config !== "object") return config;
+    expireIfNeeded();
+    if (!pending) return config;
+
+    const filtered = { ...config };
+    const hasCenter = Object.prototype.hasOwnProperty.call(config, "center_freq");
+    const hasOffset = Object.prototype.hasOwnProperty.call(config, "start_offset_freq");
+    const centerMatches = !hasCenter || near(config.center_freq, pending.centerHz);
+    const offsetMatches = !hasOffset || near(config.start_offset_freq, pending.offsetHz);
+    let suppressed = false;
+    let acknowledged = false;
+
+    if (pending.kind === "offset") {
+      // An offset tune does not authorize a source-center change. Keep a
+      // matching center field, but suppress an older/different center during
+      // the short acknowledgement window.
+      if (hasCenter && !centerMatches) {
+        delete filtered.center_freq;
+        suppressed = true;
+      }
+      if (hasOffset && !offsetMatches) {
+        delete filtered.start_offset_freq;
+        suppressed = true;
+      }
+      acknowledged = hasOffset && offsetMatches && centerMatches;
+    } else if (pending.kind === "center") {
+      if (hasCenter && !centerMatches) {
+        delete filtered.center_freq;
+        suppressed = true;
+      }
+      if (hasOffset && !offsetMatches) {
+        delete filtered.start_offset_freq;
+        suppressed = true;
+      }
+      // setfrequency is considered acknowledged only when the server reports
+      // the requested center and, when supplied, the expected zero offset.
+      acknowledged = hasCenter && centerMatches && hasOffset && offsetMatches;
+    }
+
+    if (suppressed) WebRxDiagnostics.markTuningStaleSuppressed();
+    if (acknowledged) {
+      WebRxDiagnostics.markTuningAck();
+      pending = null;
+    }
+    return filtered;
+  }
+
+  function snapshot() {
+    expireIfNeeded();
+    if (!pending) return { generation, pending: null, holdMs: HOLD_MS };
+    const now = webRxNowMs();
+    return {
+      generation,
+      holdMs: HOLD_MS,
+      pending: {
+        ...pending,
+        ageMs: Number((now - pending.createdMs).toFixed(1)),
+        expiresInMs: Number(Math.max(0, pending.expiresMs - now).toFixed(1))
+      }
+    };
+  }
+
+  return { noteIntent, markSent, filterServerConfig, snapshot };
+})();
+window.TuningStateGuard = TuningStateGuard;
+
+function updateManualFrequencyInput(options = {}) {
+  const freqInput = document.getElementById("manualFreqInput");
+  if (!freqInput) return;
+  if (options.preserveFocus && document.activeElement === freqInput) return;
+
+  const receiverHz = ReceiverState.centerHz + ReceiverState.offsetHz;
+  if (Number.isFinite(receiverHz)) {
+    freqInput.value = (receiverHz / 1e6).toFixed(6);
+  }
+}
+
+function applyReceiverStatePatch(patch, source = "unknown", options = {}) {
+  const previousCenterHz = ReceiverState.centerHz;
+  const previousSampleRateHz = ReceiverState.sampleRateHz;
+  const previousFftSize = ReceiverState.fftSize;
+
+  if (Number.isFinite(Number(patch.centerHz))) {
+    ReceiverState.centerHz = Number(patch.centerHz);
+  }
+  if (Number.isFinite(Number(patch.sampleRateHz)) && Number(patch.sampleRateHz) > 0) {
+    ReceiverState.sampleRateHz = Number(patch.sampleRateHz);
+  }
+  if (Number.isFinite(Number(patch.fftSize)) && Number(patch.fftSize) > 0) {
+    ReceiverState.fftSize = Number(patch.fftSize);
+  }
+  if (Number.isFinite(Number(patch.offsetHz))) {
+    ReceiverState.offsetHz = Number(patch.offsetHz);
+  }
+
+  // Keep the legacy globals synchronized while the remaining index.php code is
+  // migrated incrementally. New tuning code must use ReceiverState/FrequencyController.
+  center_freq = ReceiverState.centerHz;
+  offsetFrequency = ReceiverState.offsetHz;
+  bandwidth = ReceiverState.sampleRateHz;
+  fft_size = ReceiverState.fftSize;
+  // Also expose compatibility mirrors for legacy helpers that explicitly read
+  // window.* instead of the shared global lexical bindings.
+  window.center_freq = center_freq;
+  window.offsetFrequency = offsetFrequency;
+  window.bandwidth = bandwidth;
+  window.fft_size = fft_size;
+
+  ReceiverState.epoch++;
+  ReceiverState.lastSource = source;
+
+  const acquisitionAxisChanged =
+    previousCenterHz !== ReceiverState.centerHz ||
+    previousSampleRateHz !== ReceiverState.sampleRateHz ||
+    previousFftSize !== ReceiverState.fftSize;
+
+  if (acquisitionAxisChanged) {
+    ReceiverState.acquisitionEpoch++;
+    maxHoldData = [];
+    if (typeof invalidateSpectrumStaticLayer === "function") {
+      invalidateSpectrumStaticLayer();
+    }
+    if (typeof WaterfallEngine !== "undefined" &&
+        typeof WaterfallEngine.onAcquisitionChanged === "function") {
+      WaterfallEngine.onAcquisitionChanged();
+    }
+  }
+
+  if (options.updateInput !== false) {
+    updateManualFrequencyInput({ preserveFocus: !!options.preserveInputFocus });
+  }
+}
+
+function applyServerReceiverConfig(config) {
+  if (!config || typeof config !== "object") return;
+
+  // Keep non-tuning server fields flowing even if an older center/offset frame
+  // arrives while a newer local tune is waiting for acknowledgement.
+  const effectiveConfig = TuningStateGuard.filterServerConfig(config);
+  const patch = {};
+  if (Object.prototype.hasOwnProperty.call(effectiveConfig, "center_freq")) {
+    patch.centerHz = Number(effectiveConfig.center_freq);
+  }
+  if (Object.prototype.hasOwnProperty.call(effectiveConfig, "start_offset_freq")) {
+    patch.offsetHz = Number(effectiveConfig.start_offset_freq);
+  }
+  if (Object.prototype.hasOwnProperty.call(effectiveConfig, "samp_rate")) {
+    patch.sampleRateHz = Number(effectiveConfig.samp_rate);
+  }
+  if (Object.prototype.hasOwnProperty.call(effectiveConfig, "fft_size")) {
+    patch.fftSize = Number(effectiveConfig.fft_size);
+  }
+
+  if (Object.keys(patch).length > 0) {
+    applyReceiverStatePatch(patch, "server.config", {
+      updateInput: true,
+      preserveInputFocus: true
+    });
+  }
+  WebRxDiagnostics.markServerState();
+
+  // Critical ownership rule: server -> browser state updates NEVER echo a
+  // setfrequency/offset_freq command back to the server.
+  drawScale();
+  if (typeof scheduleSpectrumFrame === "function") {
+    scheduleSpectrumFrame();
+  }
+}
+
+function scheduleMaxHoldReset() {
+  if (maxHoldResetTimer) clearTimeout(maxHoldResetTimer);
+  maxHoldResetTimer = setTimeout(() => {
+    maxHoldData = [];
+  }, 500);
+}
+
+const FrequencyController = (() => {
+  // 40 Hz is fast enough to feel continuous while bounding WebSocket/control
+  // load. Rendering/local state remains event-rate and is not throttled.
+  const OFFSET_SEND_INTERVAL_MS = 25;
+  let queuedOffset = null;
+  let queuedTimer = null;
+  let lastOffsetSendMs = -Infinity;
+  let lastSentOffsetHz = null;
+
+  function clearQueuedTimer() {
+    if (queuedTimer !== null) {
+      clearTimeout(queuedTimer);
+      queuedTimer = null;
+    }
+  }
+
+  function sendOffsetNow(offsetHz, reason, intentGeneration) {
+    const sent = sendMessageToServer({
+      type: "dspcontrol",
+      params: { offset_freq: Math.round(offsetHz) }
+    });
+    if (sent) {
+      lastOffsetSendMs = webRxNowMs();
+      lastSentOffsetHz = Math.round(offsetHz);
+      TuningStateGuard.markSent(intentGeneration);
+      WebRxDiagnostics.markTune("offset_freq", offsetHz, reason);
+    } else {
+      WebRxDiagnostics.markTuneSendFailure();
+    }
+    return sent;
+  }
+
+  function sendCenterNow(centerHz, reason, intentGeneration) {
+    cancelPendingOffset();
+    const sent = sendMessageToServer({
+      type: "setfrequency",
+      params: {
+        frequency: Math.round(centerHz),
+        key: "memagic"
+      }
+    });
+    if (sent) {
+      TuningStateGuard.markSent(intentGeneration);
+      WebRxDiagnostics.markTune("setfrequency", centerHz, reason);
+    } else {
+      WebRxDiagnostics.markTuneSendFailure();
+    }
+    return sent;
+  }
+
+  function drainQueuedOffset(reasonOverride = "") {
+    clearQueuedTimer();
+    if (!queuedOffset) return false;
+    const item = queuedOffset;
+    queuedOffset = null;
+    return sendOffsetNow(
+      item.offsetHz,
+      reasonOverride || item.reason,
+      item.intentGeneration
+    );
+  }
+
+  function armQueuedOffsetTimer() {
+    if (!queuedOffset || queuedTimer !== null) return;
+    const elapsed = webRxNowMs() - lastOffsetSendMs;
+    const delay = Math.max(0, OFFSET_SEND_INTERVAL_MS - elapsed);
+    queuedTimer = setTimeout(() => {
+      queuedTimer = null;
+      drainQueuedOffset();
+    }, delay);
+  }
+
+  function scheduleOffset(offsetHz, reason, intentGeneration) {
+    const now = webRxNowMs();
+    const elapsed = now - lastOffsetSendMs;
+
+    if (elapsed >= OFFSET_SEND_INTERVAL_MS && queuedTimer === null) {
+      queuedOffset = null;
+      return sendOffsetNow(offsetHz, reason, intentGeneration);
+    }
+
+    queuedOffset = { offsetHz, reason, intentGeneration };
+    WebRxDiagnostics.markTuningCoalesced();
+    armQueuedOffsetTimer();
+    return true;
+  }
+
+  function cancelPendingOffset() {
+    clearQueuedTimer();
+    queuedOffset = null;
+  }
+
+  function flushPendingOffset(reason = "tuning.flush") {
+    WebRxDiagnostics.markTuningFlush();
+    if (!queuedOffset) return true;
+    return drainQueuedOffset(reason);
+  }
+
+  function refreshVisuals() {
+    drawScale();
+    if (typeof scheduleSpectrumFrame === "function") scheduleSpectrumFrame();
+  }
+
+  function requestOffsetHz(requestedOffsetHz, reason = "ui.offset", options = {}) {
+    const sampleRateHz = ReceiverState.sampleRateHz;
+    if (!Number.isFinite(sampleRateHz) || sampleRateHz <= 0) return false;
+
+    const halfSpan = sampleRateHz / 2;
+    const offsetHz = Math.max(-halfSpan, Math.min(halfSpan, Number(requestedOffsetHz)));
+    if (!Number.isFinite(offsetHz)) return false;
+
+    const intentGeneration = TuningStateGuard.noteIntent(
+      "offset", ReceiverState.centerHz, offsetHz, reason
+    );
+    applyReceiverStatePatch({ offsetHz }, reason, { updateInput: true });
+
+    if (options && options.coalesce === true) {
+      scheduleOffset(offsetHz, reason, intentGeneration);
+    } else {
+      cancelPendingOffset();
+      sendOffsetNow(offsetHz, reason, intentGeneration);
+    }
+
+    refreshVisuals();
+    return true;
+  }
+
+  function requestReceiverHz(requestedReceiverHz, reason = "ui.frequency") {
+    let receiverHz = Number(requestedReceiverHz);
+    if (!Number.isFinite(receiverHz)) return false;
+
+    receiverHz = Math.max(RECEIVER_MIN_HZ, Math.min(RECEIVER_MAX_HZ, receiverHz));
+
+    const centerHz = ReceiverState.centerHz;
+    const sampleRateHz = ReceiverState.sampleRateHz;
+    const halfSpan = Number.isFinite(sampleRateHz) && sampleRateHz > 0 ? sampleRateHz / 2 : 0;
+    const insideCurrentSpan = Number.isFinite(centerHz) && halfSpan > 0 &&
+      receiverHz >= centerHz - halfSpan && receiverHz <= centerHz + halfSpan;
+
+    if (insideCurrentSpan) {
+      const offsetHz = receiverHz - centerHz;
+      const intentGeneration = TuningStateGuard.noteIntent(
+        "offset", centerHz, offsetHz, reason
+      );
+      applyReceiverStatePatch({ offsetHz }, reason, { updateInput: true });
+      cancelPendingOffset();
+      sendOffsetNow(offsetHz, reason, intentGeneration);
+    } else {
+      const intentGeneration = TuningStateGuard.noteIntent(
+        "center", receiverHz, 0, reason
+      );
+      applyReceiverStatePatch({ centerHz: receiverHz, offsetHz: 0 }, reason, { updateInput: true });
+      sendCenterNow(receiverHz, reason, intentGeneration);
+      scheduleMaxHoldReset();
+    }
+
+    refreshVisuals();
+    return true;
+  }
+
+  function getSchedulerSnapshot() {
+    return {
+      maxSendHz: Math.round(1000 / OFFSET_SEND_INTERVAL_MS),
+      intervalMs: OFFSET_SEND_INTERVAL_MS,
+      queued: queuedOffset ? { ...queuedOffset } : null,
+      timerPending: queuedTimer !== null,
+      lastOffsetSendAgoMs: Number.isFinite(lastOffsetSendMs)
+        ? Number(Math.max(0, webRxNowMs() - lastOffsetSendMs).toFixed(1))
+        : null,
+      lastSentOffsetHz
+    };
+  }
+
+  return {
+    requestOffsetHz,
+    requestReceiverHz,
+    flushPendingOffset,
+    cancelPendingOffset,
+    getReceiverHz: () => ReceiverState.centerHz + ReceiverState.offsetHz,
+    getSnapshot: () => ({ ...ReceiverState }),
+    getSchedulerSnapshot
+  };
+})();
+window.FrequencyController = FrequencyController;
 
 // === THEME DETECTION ===
 window.addEventListener('DOMContentLoaded', () => {
@@ -79,14 +2229,76 @@ function audioReporter(stats) {
   // }
 }
 
+function isLoopbackHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+}
+
+function resolveAstraRxWsUrl() {
+  const configured =
+    (typeof window.ASTRARX_WS_URL === 'string')
+      ? window.ASTRARX_WS_URL.trim()
+      : '';
+
+  // Browser-side default: connect to AstraRX on the same machine that served
+  // index.php.  This is intentionally different from a local Qt client's
+  // 127.0.0.1 default because 127.0.0.1 in a browser refers to the browser PC.
+  const wsScheme = (window.location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const browserDefault = `${wsScheme}//${window.location.hostname}:8074/ws/qt5`;
+
+  if (configured === '') {
+    console.info('[ASTRARX-BACKEND] ASTRARX_WS_URL is not set; using page host.');
+    return browserDefault;
+  }
+
+  try {
+    const url = new URL(configured, window.location.href);
+
+    // ASTRARX_WS_URL often comes from the same environment used by the Qt
+    // client and therefore contains 127.0.0.1.  When this page is being viewed
+    // remotely, transparently keep the port/path but replace only the loopback
+    // host with the browser-visible server hostname.
+    if (isLoopbackHost(url.hostname) && !isLoopbackHost(window.location.hostname)) {
+      const configuredUrl = url.toString();
+      url.hostname = window.location.hostname;
+      console.info(
+        '[ASTRARX-BACKEND] Browser cannot use remote loopback endpoint;',
+        configuredUrl,
+        '->',
+        url.toString()
+      );
+      return url.toString();
+    }
+
+    return url.toString();
+  } catch (error) {
+    console.warn(
+      '[ASTRARX-BACKEND] Invalid ASTRARX_WS_URL:',
+      configured,
+      '- using',
+      browserDefault,
+      error
+    );
+    return browserDefault;
+  }
+}
+
 if (typeof ws === 'undefined') {
-  const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  var ws = new WebSocket(wsScheme + location.host + ":8073/ws/");
+  const astraRxWsUrl = resolveAstraRxWsUrl();
+
+  console.info('[ASTRARX-BACKEND] WebSocket =', astraRxWsUrl);
+  if (location.protocol === 'https:' && astraRxWsUrl.startsWith('ws://')) {
+    console.warn('[ASTRARX-BACKEND] HTTPS page cannot normally open an insecure ws:// endpoint. Set ASTRARX_WS_URL to wss://... when TLS is enabled.');
+  }
+
+  var ws = new WebSocket(astraRxWsUrl);
 }
 
 document.body.addEventListener('click', () => {
-  if (audioEngine && audioEngine.state === 'suspended') {
-    console.log("suspended undefined", audioEngine.state)
+  if (audioEngine &&
+      audioEngine.audioContext &&
+      audioEngine.audioContext.state === 'suspended') {
+    WebRxDiagnostics.markAudioResumeRequest();
     audioEngine.resume();
   }
 });
@@ -125,52 +2337,15 @@ ws.onmessage = (evt) => {
           var initial_demodulator_params = {};
           if ('start_mod' in config)
             initial_demodulator_params['mod'] = config['start_mod'];
-          if ('center_freq' in config) {
-            center_freq = config['center_freq'];
-            //console.log("center_freq offsetFrequency", offsetFrequency, "center_freq", center_freq)
-            const freqInput = document.getElementById("manualFreqInput");
-            if (freqInput) {
-              const minAllowed = center_freq - (bandwidth / 2);
-              const maxAllowed = center_freq + (bandwidth / 2);
-              let displayHz = center_freq + offsetFrequency;
-
-              if (displayHz < minAllowed || displayHz > maxAllowed) {
-                offsetFrequency = 0;
-                displayHz = center_freq;
-              }
-
-              freqInput.value = (displayHz / 1e6).toFixed(6);
-              setOffset();
-            }
-          }
-
-          if ('start_offset_freq' in config) {
+          if ('start_offset_freq' in config)
             initial_demodulator_params['offset_frequency'] = config['start_offset_freq'];
-            offsetFrequency = config["start_offset_freq"];
-            const freqInput = document.getElementById("manualFreqInput");
-            if (freqInput) {
-              const minAllowed = center_freq - (bandwidth / 2);
-              const maxAllowed = center_freq + (bandwidth / 2);
-              let displayHz = center_freq + offsetFrequency;
-
-              if (displayHz < minAllowed || displayHz > maxAllowed) {
-                offsetFrequency = 0;
-                displayHz = center_freq;
-              }
-
-              if (document.activeElement !== freqInput) {
-                freqInput.value = (displayHz / 1e6).toFixed(6);
-              }
-
-              setOffset();
-            }
-            //console.log("start_offset_freq offsetFrequency", offsetFrequency, "center_freq", center_freq)
-          }
           if ('initial_squelch_level' in config)
             initial_demodulator_params['squelch_level'] = Number.isInteger(config['initial_squelch_level']) ? config['initial_squelch_level'] : -150;
 
-          if ('samp_rate' in config) bandwidth = config['samp_rate'];
-          if ('fft_size' in config) fft_size = config['fft_size'];
+          // Apply center/offset/sample-rate/FFT as one server-authoritative state
+          // transition. Do not call setOffset() here: RX state must never become
+          // a new TX tuning command.
+          applyServerReceiverConfig(config);
           if ('audio_compression' in config) {
             var audio_compression = config['audio_compression'];
             if (typeof audioEngine === 'undefined') {
@@ -182,6 +2357,11 @@ ws.onmessage = (evt) => {
 
           if ('waterfall_colors' in config && Array.isArray(config['waterfall_colors'])) {
             waterfallColorMap = config['waterfall_colors'].map(Number);
+            waterfallPaletteRevision++;
+            if (typeof WaterfallEngine !== 'undefined' &&
+                typeof WaterfallEngine.invalidateProjection === 'function') {
+              WaterfallEngine.invalidateProjection('server.waterfall_colors');
+            }
             //console.log('[CFG] Received waterfallColorMap with', waterfallColorMap.length, 'entries');
           }
           drawScale();
@@ -273,6 +2453,7 @@ ws.onmessage = (evt) => {
         break;
       case 2:
         // audio data
+        WebRxDiagnostics.markAudioPacket(false, data.byteLength);
         if (typeof audioEngine === 'undefined') {
           audioEngine = new AudioEngine(audio_buffer_maximal_length_sec, audioReporter);
         }
@@ -284,6 +2465,7 @@ ws.onmessage = (evt) => {
         break;
       case 4:
         // hd audio data
+        WebRxDiagnostics.markAudioPacket(true, data.byteLength);
         if (typeof audioEngine === 'undefined') {
           audioEngine = new AudioEngine(audio_buffer_maximal_length_sec, audioReporter);
         }
@@ -302,9 +2484,10 @@ ws.onmessage = (evt) => {
 function sendMessageToServer(message) {
   if (typeof ws !== 'undefined' && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
-  } else {
-    console.warn("WebSocket is not open.");
+    return true;
   }
+  console.warn("WebSocket is not open.");
+  return false;
 }
 
 const getStoredTheme = () => localStorage.getItem('theme')
@@ -339,14 +2522,16 @@ function setTheme(mode) {
     textColor = '#222';
     bgColor = '#fefefe';
   }
+  if (typeof invalidateSpectrumStaticLayer === "function") invalidateSpectrumStaticLayer();
   drawScale();
   const data = getLatestFFTData();
   drawSpectrum(data);
-  drawWaterfallLine(data);
+  // Theme changes must not advance waterfall history with a duplicate RF row.
   drawSMeter(currentSMeterValue);
 }
 
 let latestFFT = new Float32Array(0);
+let spectrumSourceRevision = 0;
 let currentSMeterValue = 0;
 
 function normalizeFFTData(raw) {
@@ -447,8 +2632,9 @@ function drawScale() {
   ctx.fillStyle = textColor;
   ctx.font = '12px sans-serif';
   const freqSteps = 10;
-  const startFreq = center_freq - bandwidth / 2;
-  const endFreq = center_freq + bandwidth / 2;
+  const view = FrequencyViewTransform.getViewSnapshot();
+  const startFreq = view.viewStartHz;
+  const endFreq = view.viewEndHz;
   for (let i = 0; i <= freqSteps; i++) {
     const x = (i / freqSteps) * width;
     const freq = startFreq + (endFreq - startFreq) * (i / freqSteps);
@@ -492,33 +2678,56 @@ function drawScale() {
 //   drawOverlayLine(ctx, width, height);
 // }
 
-// === DRAW SPECTRUM ===
-function drawSpectrum(data) {
-  const canvas = document.getElementById('spectrum-plot');
-  if (!canvas) return;
-  canvas.width = canvas.offsetWidth;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  const width = canvas.width;
-  const height = canvas.height;
+// === DRAW SPECTRUM (AstraRX-style presentation path) ===
+let spectrumStaticLayer = null;
+let spectrumStaticLayerKey = "";
+let spectrumFramePending = false;
+
+function invalidateSpectrumStaticLayer() {
+  spectrumStaticLayerKey = "";
+}
+
+function ensureSpectrumCanvasSize(canvas) {
+  const displayWidth = Math.max(1, Math.round(canvas.clientWidth || canvas.offsetWidth || canvas.width || 1));
+  if (canvas.width !== displayWidth) {
+    canvas.width = displayWidth;
+    invalidateSpectrumStaticLayer();
+    return true;
+  }
+  return false;
+}
+
+function getSpectrumStaticLayer(width, height) {
+  const view = FrequencyViewTransform.getViewSnapshot();
+  const key = [
+    width, height, bgColor, gridColor, textColor,
+    waterfallMinDb, waterfallMaxDb,
+    ReceiverState.centerHz, ReceiverState.sampleRateHz,
+    view.viewStartHz, view.viewEndHz
+  ].join("|");
+
+  if (!spectrumStaticLayer) spectrumStaticLayer = document.createElement("canvas");
+  if (spectrumStaticLayerKey === key &&
+      spectrumStaticLayer.width === width && spectrumStaticLayer.height === height) {
+    return spectrumStaticLayer;
+  }
+
+  spectrumStaticLayer.width = width;
+  spectrumStaticLayer.height = height;
+  const ctx = spectrumStaticLayer.getContext("2d");
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = bgColor;
   ctx.fillRect(0, 0, width, height);
   ctx.strokeStyle = gridColor;
   ctx.fillStyle = textColor;
-  ctx.font = '12px sans-serif';
+  ctx.font = "12px sans-serif";
+  ctx.lineWidth = 1;
 
-  if (!data || data.length === 0) {
-    drawOverlayLine(ctx, width, height);
-    return;
-  }
-
-  const lenMinusOne = Math.max(1, data.length - 1);
-
+  const rangeDb = waterfallMaxDb - waterfallMinDb;
   const dBSteps = 10;
   for (let i = 0; i <= dBSteps; i++) {
-    const dB = waterfallMinDb + i * (waterfallMaxDb - waterfallMinDb) / dBSteps;
-    const y = height - ((dB - waterfallMinDb) / (waterfallMaxDb - waterfallMinDb)) * height;
+    const dB = waterfallMinDb + i * rangeDb / dBSteps;
+    const y = height - ((dB - waterfallMinDb) / rangeDb) * height;
     ctx.beginPath();
     ctx.moveTo(0, y);
     ctx.lineTo(width, y);
@@ -527,54 +2736,214 @@ function drawSpectrum(data) {
   }
 
   const freqSteps = 10;
-  const startFreq = center_freq - bandwidth / 2;
-  const endFreq = center_freq + bandwidth / 2;
   for (let i = 0; i <= freqSteps; i++) {
     const x = (i / freqSteps) * width;
-    const freq = startFreq + (endFreq - startFreq) * (i / freqSteps);
     ctx.beginPath();
     ctx.moveTo(x, 0);
     ctx.lineTo(x, height);
     ctx.stroke();
   }
 
-  ctx.beginPath();
-  for (let i = 0; i < data.length; i++) {
-    const dB = data[i];
-    const norm = (dB - waterfallMinDb) / (waterfallMaxDb - waterfallMinDb);
-    const y = height - (norm * height);
-    const x = (i / lenMinusOne) * width;
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  }
-  ctx.strokeStyle = '#00ff00';
-  ctx.lineWidth = 1;
-  ctx.stroke();
+  spectrumStaticLayerKey = key;
+  return spectrumStaticLayer;
+}
 
-  // === Max Hold Update ===
+function spectrumDbToY(dB, height) {
+  const rangeDb = waterfallMaxDb - waterfallMinDb;
+  if (!(rangeDb > 0)) return height;
+  const norm = (dB - waterfallMinDb) / rangeDb;
+  return height - (norm * height);
+}
+
+function drawPixelAwareTrace(ctx, data, width, height, color, lineWidth = 1, startBin = 0, endBin = null) {
+  if (!data || data.length === 0 || width <= 0) return;
+
+  const start = Math.max(0, Math.min(data.length - 1, Math.floor(Number(startBin) || 0)));
+  const end = Math.max(start + 1, Math.min(data.length, Math.floor(endBin == null ? data.length : Number(endBin))));
+  const visibleCount = end - start;
+  if (visibleCount <= 0) return;
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+
+  // Phase E.4 processes only the currently visible RF bins. The Canvas remains
+  // viewport-sized regardless of zoom, so work scales with what the user sees.
+  if (visibleCount <= width * 2) {
+    const countMinusOne = Math.max(1, visibleCount - 1);
+    ctx.beginPath();
+    for (let i = 0; i < visibleCount; i++) {
+      const x = (i / countMinusOne) * width;
+      const y = spectrumDbToY(data[start + i], height);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    return;
+  }
+
+  const binsPerPixel = visibleCount / width;
+  ctx.beginPath();
+  for (let x = 0; x < width; x++) {
+    const localStart = Math.floor(x * binsPerPixel);
+    const localEnd = Math.max(
+      localStart + 1,
+      Math.min(visibleCount, Math.floor((x + 1) * binsPerPixel))
+    );
+    let minDb = Infinity;
+    let maxDb = -Infinity;
+    for (let local = localStart; local < localEnd; local++) {
+      const v = data[start + local];
+      if (v < minDb) minDb = v;
+      if (v > maxDb) maxDb = v;
+    }
+    if (!Number.isFinite(minDb) || !Number.isFinite(maxDb)) continue;
+    ctx.moveTo(x + 0.5, spectrumDbToY(maxDb, height));
+    ctx.lineTo(x + 0.5, spectrumDbToY(minDb, height));
+  }
+  ctx.stroke();
+}
+
+function updateMaxHoldFromSource(data) {
+  if (!data || data.length === 0) return;
   if (maxHoldData.length !== data.length) {
     maxHoldData = new Array(data.length).fill(-Infinity);
   }
-
   for (let i = 0; i < data.length; i++) {
     maxHoldData[i] = Math.max(maxHoldData[i], data[i]);
   }
+}
 
-  // === Max Hold Line Rendering ===
-  if (showMaxHold) {
-    ctx.beginPath();
-    for (let i = 0; i < maxHoldData.length; i++) {
-      const dB = maxHoldData[i];
-      const norm = (dB - waterfallMinDb) / (waterfallMaxDb - waterfallMinDb);
-      const y = height - (norm * height);
-      const x = (i / Math.max(1, maxHoldData.length - 1)) * width;
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+function drawSpectrum(data) {
+  const startMs = webRxNowMs();
+  const canvas = document.getElementById("spectrum-plot");
+  if (!canvas) return;
+  ensureSpectrumCanvasSize(canvas);
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const width = canvas.width;
+  const height = canvas.height;
+
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(getSpectrumStaticLayer(width, height), 0, 0);
+
+  if (data && data.length) {
+    const visible = FrequencyViewTransform.visibleBinRange(data.length);
+    drawPixelAwareTrace(ctx, data, width, height, "#00ff00", 1, visible.start, visible.end);
+    if (showMaxHold && maxHoldData.length) {
+      const maxEnd = Math.min(visible.end, maxHoldData.length);
+      drawPixelAwareTrace(ctx, maxHoldData, width, height, "#ff00ff55", 1, visible.start, maxEnd);
     }
-    ctx.strokeStyle = '#ff00ff55';  // Magenta for Max Hold
-    ctx.lineWidth = 1;
-    ctx.stroke();
   }
 
   drawOverlayLine(ctx, width, height);
+  WebRxDiagnostics.markSpectrumPresented(webRxNowMs() - startMs);
+}
+
+function getSpectrumWorkerViewKey(dataLength, width, height) {
+  const visible = FrequencyViewTransform.visibleBinRange(dataLength);
+  const view = FrequencyViewTransform.getViewSnapshot();
+  return [
+    dataLength,
+    width,
+    height,
+    visible.start,
+    visible.end,
+    view.viewStartHz,
+    view.viewEndHz,
+    waterfallMinDb,
+    waterfallMaxDb,
+    showMaxHold ? 1 : 0
+  ].join('|');
+}
+
+function drawReducedEnvelope(ctx, envelope, width, height, color, lineWidth = 1) {
+  if (!envelope || envelope.length < width * 2) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.beginPath();
+  for (let x = 0; x < width; x++) {
+    const minDb = envelope[x * 2];
+    const maxDb = envelope[x * 2 + 1];
+    if (!Number.isFinite(minDb) || !Number.isFinite(maxDb)) continue;
+    ctx.moveTo(x + 0.5, spectrumDbToY(maxDb, height));
+    ctx.lineTo(x + 0.5, spectrumDbToY(minDb, height));
+  }
+  ctx.stroke();
+}
+
+function presentSpectrumWorkerResult(message) {
+  const canvas = document.getElementById('spectrum-plot');
+  if (!canvas) return false;
+  ensureSpectrumCanvasSize(canvas);
+  const width = canvas.width;
+  const height = canvas.height;
+  const latest = getLatestFFTData();
+  const currentKey = getSpectrumWorkerViewKey(latest.length, width, height);
+
+  if (message.sourceRevision !== spectrumSourceRevision ||
+      message.viewKey !== currentKey ||
+      message.width !== width) {
+    return false;
+  }
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return false;
+  const startMs = webRxNowMs();
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(getSpectrumStaticLayer(width, height), 0, 0);
+
+  drawReducedEnvelope(ctx, new Float32Array(message.envelope), width, height, '#00ff00', 1);
+  if (showMaxHold && message.maxHoldEnvelope) {
+    drawReducedEnvelope(ctx, new Float32Array(message.maxHoldEnvelope), width, height, '#ff00ff55', 1);
+  }
+
+  drawOverlayLine(ctx, width, height);
+  WebRxDiagnostics.markSpectrumPresented(webRxNowMs() - startMs);
+  return true;
+}
+
+function scheduleSpectrumFrame() {
+  if (spectrumFramePending) {
+    WebRxDiagnostics.markSpectrumCoalesced();
+    return;
+  }
+  spectrumFramePending = true;
+  requestAnimationFrame(() => {
+    spectrumFramePending = false;
+    const data = getLatestFFTData();
+    const canvas = document.getElementById('spectrum-plot');
+    if (!canvas || !data || data.length <= 0) {
+      drawSpectrum(data);
+      return;
+    }
+    ensureSpectrumCanvasSize(canvas);
+    const width = canvas.width;
+    const height = canvas.height;
+    const visible = FrequencyViewTransform.visibleBinRange(data.length);
+
+    // Worker overhead is only worthwhile for the dense envelope branch. Sparse
+    // / zoomed-in traces remain on the main thread because they are already
+    // O(visibleBins) and avoid an unnecessary copy/round-trip.
+    if (visible.count > width * RuntimePerformancePolicy.getSpectrumWorkerDensityRatio()) {
+      const sourceRevision = spectrumSourceRevision;
+      const viewKey = getSpectrumWorkerViewKey(data.length, width, height);
+      const accepted = RealtimeDspWorker.requestSpectrum({
+        data,
+        maxHold: showMaxHold && maxHoldData.length ? maxHoldData : null,
+        start: visible.start,
+        end: visible.end,
+        width,
+        sourceRevision,
+        viewKey,
+        onResult: presentSpectrumWorkerResult,
+        onFailure: () => drawSpectrum(getLatestFFTData())
+      });
+      if (accepted) return;
+    }
+
+    drawSpectrum(data);
+  });
 }
 
 function toggleMaxHold(force) {
@@ -600,38 +2969,1152 @@ function toggleMaxHold(force) {
   }
 }
 
-// === DRAW WATERFALL ===
-function drawWaterfallLine(line) {
-  const canvas = document.getElementById("waterfall");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  if (!line || line.length === 0) return;
-  const { width, height } = canvas;
-  const rangeDb = waterfallMaxDb - waterfallMinDb;
+// === WATERFALL INTENSITY (AstraRX-style Phase F) ===
+//
+// Manual slider values remain the absolute safety bounds. In Auto mode the
+// effective color range is derived from robust FFT percentiles, then smoothed
+// with asymmetric attack/release and hysteresis. This avoids frame-to-frame
+// flashing while still following a changing noise floor or strong carrier.
+const WaterfallIntensity = (() => {
+  const HIST_MIN_DB = -180;
+  const HIST_MAX_DB = 40;
+  const HIST_BINS = HIST_MAX_DB - HIST_MIN_DB + 1;
+  const histogram = new Uint32Array(HIST_BINS);
 
-  const imgHeight = height - 1;
-  if (imgHeight > 0) {
-    ctx.drawImage(canvas, 0, 0, width, imgHeight, 0, 1, width, imgHeight);
-  }
+  const defaults = Object.freeze({
+    updateEveryRows: 6,
+    sampleBudget: 4096,
+    noisePercentile: 0.20,
+    signalPercentile: 0.999,
+    noiseMarginDb: 5.0,
+    signalHeadroomDb: 3.0,
+    minDynamicRangeDb: 45.0,
+    maxDynamicRangeDb: 85.0,
+    attackAlpha: 0.45,
+    releaseAlpha: 0.08,
+    hysteresisDb: 0.50,
+    quantizeDb: 0.50,
+    reprojectThresholdDb: 0.75,
+    reprojectMinIntervalMs: 300
+  });
 
-  const colorCount = waterfallColorMap.length;
-  const lenMinusOne = Math.max(1, line.length - 1);
-  for (let i = 0; i < line.length; i++) {
-    const x = Math.floor(i / lenMinusOne * width);
-    const dB = Math.max(waterfallMinDb, Math.min(waterfallMaxDb, line[i]));
-    const norm = (dB - waterfallMinDb) / rangeDb;
-    let rgb = 0;
-    if (colorCount) {
-      const index = Math.floor(norm * (colorCount - 1));
-      rgb = waterfallColorMap[index] || 0;
+  let config = { ...defaults };
+  let mode = "auto";
+  let initialized = false;
+  let autoMinDb = waterfallMinDb;
+  let autoMaxDb = waterfallMaxDb;
+  let lastNoiseDb = null;
+  let lastSignalDb = null;
+  let rowsSeen = 0;
+  let statsUpdates = 0;
+  let rangeUpdates = 0;
+  let stateRevision = 1;
+  const NO_CHANGE = Object.freeze({ rangeChanged: false, reprojectSuggested: false, minDelta: 0, maxDelta: 0 });
+
+  try {
+    const savedMode = localStorage.getItem("webrxWaterfallIntensityMode");
+    if (savedMode === "auto" || savedMode === "manual") mode = savedMode;
+    const savedConfig = localStorage.getItem("webrxWaterfallAutoConfig");
+    if (savedConfig) {
+      const parsed = JSON.parse(savedConfig);
+      if (parsed && typeof parsed === "object") config = { ...config, ...parsed };
     }
-    const r = (rgb >> 16) & 0xFF;
-    const g = (rgb >> 8) & 0xFF;
-    const b = rgb & 0xFF;
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(x, 0, 1, 1);
+  } catch (_) {}
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
   }
+
+  function manualBounds() {
+    let minDb = Number(waterfallMinDb);
+    let maxDb = Number(waterfallMaxDb);
+    if (!Number.isFinite(minDb)) minDb = -120;
+    if (!Number.isFinite(maxDb)) maxDb = -30;
+    if (maxDb <= minDb) maxDb = minDb + 1;
+    return { minDb, maxDb };
+  }
+
+  function quantize(value) {
+    const step = Math.max(0.1, Number(config.quantizeDb) || 0.5);
+    return Math.round(value / step) * step;
+  }
+
+  function percentileFromHistogram(total, percentile) {
+    if (total <= 0) return null;
+    const threshold = Math.max(1, Math.ceil(clamp(percentile, 0, 1) * total));
+    let cumulative = 0;
+    for (let i = 0; i < HIST_BINS; i++) {
+      cumulative += histogram[i];
+      if (cumulative >= threshold) return HIST_MIN_DB + i;
+    }
+    return HIST_MAX_DB;
+  }
+
+  function collectStatistics(line, visibleRange) {
+    if (!line || line.length <= 0) return null;
+    const start = Math.max(0, Math.min(line.length - 1, visibleRange ? visibleRange.start | 0 : 0));
+    const end = Math.max(start + 1, Math.min(line.length, visibleRange ? visibleRange.end | 0 : line.length));
+    const count = end - start;
+    const budget = Math.max(128, Math.floor(Number(config.sampleBudget) || 4096));
+    const stride = Math.max(1, Math.ceil(count / budget));
+
+    histogram.fill(0);
+    let total = 0;
+    for (let i = start; i < end; i += stride) {
+      const value = line[i];
+      if (!Number.isFinite(value)) continue;
+      const bucket = Math.max(0, Math.min(HIST_BINS - 1, Math.round(value) - HIST_MIN_DB));
+      histogram[bucket]++;
+      total++;
+    }
+    if (total < 8) return null;
+
+    const noiseDb = percentileFromHistogram(total, Number(config.noisePercentile));
+    const signalDb = percentileFromHistogram(total, Number(config.signalPercentile));
+    if (!Number.isFinite(noiseDb) || !Number.isFinite(signalDb)) return null;
+    return { noiseDb, signalDb, total, stride };
+  }
+
+  function targetRange(stats) {
+    const bounds = manualBounds();
+    let targetMin = stats.noiseDb - Number(config.noiseMarginDb);
+    let targetMax = stats.signalDb + Number(config.signalHeadroomDb);
+    const minDynamic = Math.max(1, Number(config.minDynamicRangeDb) || 45);
+    const maxDynamic = Math.max(minDynamic, Number(config.maxDynamicRangeDb) || 85);
+
+    if (targetMax - targetMin < minDynamic) targetMax = targetMin + minDynamic;
+    if (targetMax - targetMin > maxDynamic) targetMin = targetMax - maxDynamic;
+
+    targetMin = clamp(targetMin, bounds.minDb, bounds.maxDb - 1);
+    targetMax = clamp(targetMax, targetMin + 1, bounds.maxDb);
+
+    // If the manual safety bounds are narrower than the requested dynamic range,
+    // preserve the user bounds rather than fabricating values outside them.
+    if (targetMax <= targetMin) {
+      targetMin = bounds.minDb;
+      targetMax = bounds.maxDb;
+    }
+    return { minDb: targetMin, maxDb: targetMax };
+  }
+
+  function smooth(current, target) {
+    const delta = target - current;
+    if (Math.abs(delta) < Math.max(0, Number(config.hysteresisDb) || 0)) return current;
+    const alpha = delta > 0
+      ? clamp(Number(config.attackAlpha), 0.001, 1)
+      : clamp(Number(config.releaseAlpha), 0.001, 1);
+    return current + delta * alpha;
+  }
+
+  function updateUiLabel() {
+    const label = document.getElementById("dbRangeLabel");
+    if (!label) return;
+    const bounds = manualBounds();
+    if (mode === "auto" && initialized) {
+      label.textContent = `Auto: ${autoMinDb.toFixed(1)} dB … ${autoMaxDb.toFixed(1)} dB  |  Bounds: ${bounds.minDb} … ${bounds.maxDb} dB`;
+    } else {
+      label.textContent = `Min: ${bounds.minDb} dB Max: ${bounds.maxDb} dB`;
+    }
+  }
+
+  function applyStatistics(stats) {
+    if (!stats || !Number.isFinite(stats.noiseDb) || !Number.isFinite(stats.signalDb)) return NO_CHANGE;
+    WebRxDiagnostics.markWaterfallIntensitySample();
+    lastNoiseDb = stats.noiseDb;
+    lastSignalDb = stats.signalDb;
+    statsUpdates++;
+
+    const target = targetRange(stats);
+    const previousMin = autoMinDb;
+    const previousMax = autoMaxDb;
+    const wasInitialized = initialized;
+
+    if (!initialized) {
+      autoMinDb = quantize(target.minDb);
+      autoMaxDb = quantize(target.maxDb);
+      initialized = true;
+    } else {
+      autoMinDb = quantize(smooth(autoMinDb, target.minDb));
+      autoMaxDb = quantize(smooth(autoMaxDb, target.maxDb));
+    }
+
+    const bounds = manualBounds();
+    autoMinDb = clamp(autoMinDb, bounds.minDb, bounds.maxDb - 1);
+    autoMaxDb = clamp(autoMaxDb, autoMinDb + 1, bounds.maxDb);
+
+    const minDelta = Math.abs(autoMinDb - previousMin);
+    const maxDelta = Math.abs(autoMaxDb - previousMax);
+    const rangeChanged = !Number.isFinite(previousMin) || !Number.isFinite(previousMax) ||
+      minDelta > 0 || maxDelta > 0;
+    const reprojectSuggested = !wasInitialized ||
+      minDelta >= Number(config.reprojectThresholdDb) ||
+      maxDelta >= Number(config.reprojectThresholdDb);
+
+    if (rangeChanged) {
+      rangeUpdates++;
+      WebRxDiagnostics.markWaterfallIntensityUpdate();
+      updateUiLabel();
+    }
+    return { rangeChanged, reprojectSuggested, minDelta, maxDelta };
+  }
+
+  function handleWorkerStatistics(message, requestRevision) {
+    if (mode !== 'auto' || requestRevision !== stateRevision ||
+        message.stateRevision !== stateRevision) {
+      return false;
+    }
+    const result = applyStatistics({
+      noiseDb: Number(message.noiseDb),
+      signalDb: Number(message.signalDb),
+      total: Number(message.total) || 0,
+      stride: Number(message.stride) || 1
+    });
+    if (result.rangeChanged && window.WaterfallEngine &&
+        typeof window.WaterfallEngine.onIntensityRangeChanged === 'function') {
+      window.WaterfallEngine.onIntensityRangeChanged(result);
+    }
+    return true;
+  }
+
+  function observeFFT(line, visibleRange) {
+    rowsSeen++;
+    if (mode !== "auto") return NO_CHANGE;
+    const updateEvery = Math.max(1, Math.ceil(
+      (Number(config.updateEveryRows) || 1) * RuntimePerformancePolicy.getWaterfallStatsCadenceMultiplier()
+    ));
+    if ((rowsSeen % updateEvery) !== 0) return NO_CHANGE;
+
+    const start = Math.max(0, Math.min(line.length - 1, visibleRange ? visibleRange.start | 0 : 0));
+    const end = Math.max(start + 1, Math.min(line.length, visibleRange ? visibleRange.end | 0 : line.length));
+    const requestRevision = stateRevision;
+    const workerAccepted = RealtimeDspWorker.requestWaterfallStats({
+      line,
+      start,
+      end,
+      stateRevision: requestRevision,
+      sampleBudget: Math.max(128, Math.floor(Number(config.sampleBudget) || 4096)),
+      noisePercentile: Number(config.noisePercentile),
+      signalPercentile: Number(config.signalPercentile),
+      histMinDb: HIST_MIN_DB,
+      histMaxDb: HIST_MAX_DB,
+      onResult: (message) => handleWorkerStatistics(message, requestRevision)
+    });
+    if (workerAccepted) return NO_CHANGE;
+
+    // Browser/CSP fallback retains the exact Phase F synchronous algorithm.
+    const stats = collectStatistics(line, visibleRange);
+    return stats ? applyStatistics(stats) : NO_CHANGE;
+  }
+
+  function getEffectiveRange() {
+    if (mode === "auto" && initialized) {
+      return { minDb: autoMinDb, maxDb: autoMaxDb, mode: "auto" };
+    }
+    const bounds = manualBounds();
+    return { minDb: bounds.minDb, maxDb: bounds.maxDb, mode: "manual" };
+  }
+
+  function setMode(nextMode) {
+    const normalized = String(nextMode || "").toLowerCase();
+    if (normalized !== "auto" && normalized !== "manual") {
+      throw new Error("Waterfall intensity mode must be 'auto' or 'manual'");
+    }
+    if (mode === normalized) return mode;
+    mode = normalized;
+    if (mode === "auto") resetAuto(false);
+    try { localStorage.setItem("webrxWaterfallIntensityMode", mode); } catch (_) {}
+    updateUiLabel();
+    if (window.WaterfallEngine && typeof window.WaterfallEngine.invalidateProjection === "function") {
+      window.WaterfallEngine.invalidateProjection("intensity-mode");
+    }
+    return mode;
+  }
+
+  function sanitizeConfig(next) {
+    const merged = { ...config, ...(next || {}) };
+    const finite = (value, fallback) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    merged.updateEveryRows = Math.max(1, Math.floor(finite(merged.updateEveryRows, defaults.updateEveryRows)));
+    merged.sampleBudget = Math.max(128, Math.floor(finite(merged.sampleBudget, defaults.sampleBudget)));
+    merged.noisePercentile = clamp(finite(merged.noisePercentile, defaults.noisePercentile), 0.01, 0.90);
+    merged.signalPercentile = clamp(finite(merged.signalPercentile, defaults.signalPercentile), 0.90, 0.9999);
+    if (merged.signalPercentile <= merged.noisePercentile) {
+      merged.signalPercentile = Math.min(0.9999, merged.noisePercentile + 0.05);
+    }
+    merged.noiseMarginDb = clamp(finite(merged.noiseMarginDb, defaults.noiseMarginDb), 0, 30);
+    merged.signalHeadroomDb = clamp(finite(merged.signalHeadroomDb, defaults.signalHeadroomDb), 0, 30);
+    merged.minDynamicRangeDb = clamp(finite(merged.minDynamicRangeDb, defaults.minDynamicRangeDb), 5, 150);
+    merged.maxDynamicRangeDb = clamp(
+      finite(merged.maxDynamicRangeDb, defaults.maxDynamicRangeDb),
+      merged.minDynamicRangeDb,
+      180
+    );
+    merged.attackAlpha = clamp(finite(merged.attackAlpha, defaults.attackAlpha), 0.001, 1);
+    merged.releaseAlpha = clamp(finite(merged.releaseAlpha, defaults.releaseAlpha), 0.001, 1);
+    merged.hysteresisDb = clamp(finite(merged.hysteresisDb, defaults.hysteresisDb), 0, 20);
+    merged.quantizeDb = clamp(finite(merged.quantizeDb, defaults.quantizeDb), 0.1, 5);
+    merged.reprojectThresholdDb = clamp(
+      finite(merged.reprojectThresholdDb, defaults.reprojectThresholdDb),
+      0.1,
+      20
+    );
+    merged.reprojectMinIntervalMs = clamp(
+      finite(merged.reprojectMinIntervalMs, defaults.reprojectMinIntervalMs),
+      50,
+      5000
+    );
+    return merged;
+  }
+
+  function configure(next = {}) {
+    config = sanitizeConfig(next);
+    try { localStorage.setItem("webrxWaterfallAutoConfig", JSON.stringify(config)); } catch (_) {}
+    resetAuto(false);
+    if (window.WaterfallEngine && typeof window.WaterfallEngine.invalidateProjection === "function") {
+      window.WaterfallEngine.invalidateProjection("intensity-config");
+    }
+    return snapshot();
+  }
+
+  function resetAuto(invalidate = true) {
+    stateRevision++;
+    initialized = false;
+    const bounds = manualBounds();
+    autoMinDb = bounds.minDb;
+    autoMaxDb = bounds.maxDb;
+    rowsSeen = 0;
+    lastNoiseDb = null;
+    lastSignalDb = null;
+    updateUiLabel();
+    if (invalidate && window.WaterfallEngine &&
+        typeof window.WaterfallEngine.invalidateProjection === "function") {
+      window.WaterfallEngine.invalidateProjection("intensity-reset");
+    }
+  }
+
+  function onManualBoundsChanged() {
+    stateRevision++;
+    const bounds = manualBounds();
+    if (initialized) {
+      autoMinDb = clamp(autoMinDb, bounds.minDb, bounds.maxDb - 1);
+      autoMaxDb = clamp(autoMaxDb, autoMinDb + 1, bounds.maxDb);
+    }
+    updateUiLabel();
+  }
+
+  function getReprojectMinIntervalMs() {
+    return config.reprojectMinIntervalMs * RuntimePerformancePolicy.getWaterfallReprojectIntervalMultiplier();
+  }
+
+  function snapshot() {
+    const effective = getEffectiveRange();
+    return {
+      mode,
+      initialized,
+      effectiveMinDb: effective.minDb,
+      effectiveMaxDb: effective.maxDb,
+      manualMinDb: manualBounds().minDb,
+      manualMaxDb: manualBounds().maxDb,
+      lastNoiseDb,
+      lastSignalDb,
+      rowsSeen,
+      statsUpdates,
+      rangeUpdates,
+      stateRevision,
+      worker: RealtimeDspWorker.snapshot(),
+      config: { ...config }
+    };
+  }
+
+  // Sanitize any persisted config before first use.
+  config = sanitizeConfig(config);
+
+  return {
+    observeFFT,
+    getEffectiveRange,
+    setMode,
+    configure,
+    resetAuto,
+    onManualBoundsChanged,
+    updateUiLabel,
+    getReprojectMinIntervalMs,
+    snapshot
+  };
+})();
+window.WaterfallIntensity = WaterfallIntensity;
+window.setWaterfallIntensityMode = (mode) => WaterfallIntensity.setMode(mode);
+window.configureWaterfallAuto = (options) => WaterfallIntensity.configure(options);
+
+// === DRAW WATERFALL (AstraRX-style Phase E engine) ===
+//
+// RF history is now independent from Canvas geometry. Every source FFT row is
+// stored in acquisition-domain dB bins. Canvas RGBA rows are only a projection
+// cache, so Zoom / horizontal Pan / browser Resize can rebuild the view without
+// losing RF history or inventing duplicate time rows.
+const WaterfallEngine = (() => {
+  let canvas = null;
+  let ctx = null;
+
+  // Source-domain history (persistent across presentation geometry changes).
+  let sourceBins = 0;
+  let capacityRows = 0;
+  let sourceHistory = null; // Float32Array: [physical row][source bin]
+  let headRow = 0;          // newest physical row
+  let rowsWritten = 0;
+  let acquisitionKey = "";
+
+  // Presentation cache (rebuildable from sourceHistory at any time).
+  let projectedWidth = 0;
+  let projectedHeight = 0;
+  let rowBytes = 0;
+  let rgbaHistory = null;
+  let projectionDirty = true;
+  let projectionReason = "bootstrap";
+  let framePending = false;
+
+  // Phase J worker state. The worker only rebuilds the presentation cache;
+  // sourceHistory remains owned by the main thread and stays authoritative.
+  const WATERFALL_WORKER_URL = 'static/lib/WebRxDspWorker.js';
+  let projectionRevision = 1;
+  let sourceRevision = 0;
+  let workerRequestSerial = 0;
+  let workerInstance = null;
+  let workerBusy = false;
+  let workerDisabled = false;
+  let workerPreferred = true;
+  let activeWorkerRequest = null;
+  try {
+    workerPreferred = localStorage.getItem('webrxWaterfallWorker') !== '0';
+  } catch (_) {}
+
+  // Phase F color path: one 256-entry RGBA palette LUT plus a fixed-domain
+  // dB->palette-index LUT. Per-pixel rendering therefore avoids parsing colors
+  // and recomputing the full dB normalization expression.
+  const COLOR_LUT_SIZE = 256;
+  const DB_LUT_MIN = -180;
+  const DB_LUT_MAX = 40;
+  const DB_LUT_STEP = 0.25;
+  const DB_LUT_SIZE = Math.round((DB_LUT_MAX - DB_LUT_MIN) / DB_LUT_STEP) + 1;
+  const colorLut = new Uint8ClampedArray(COLOR_LUT_SIZE * 4);
+  const dbToColorIndexLut = new Uint8Array(DB_LUT_SIZE);
+  let paletteRevisionSeen = -1;
+  let colorRangeMinDb = NaN;
+  let colorRangeMaxDb = NaN;
+  let lastIntensityProjectionMs = 0;
+
+  function markProjectionDirty(reason = "view") {
+    projectionDirty = true;
+    projectionReason = reason;
+    projectionRevision++;
+  }
+
+  function workerSupported() {
+    return workerPreferred && !workerDisabled && typeof Worker === 'function';
+  }
+
+  function terminateWorker(disable = false) {
+    if (workerInstance) {
+      try { workerInstance.terminate(); } catch (_) {}
+    }
+    workerInstance = null;
+    workerBusy = false;
+    activeWorkerRequest = null;
+    if (disable) workerDisabled = true;
+  }
+
+  function workerSnapshot() {
+    return {
+      supported: typeof Worker === 'function',
+      preferred: workerPreferred,
+      disabled: workerDisabled,
+      active: !!workerInstance,
+      busy: workerBusy,
+      requestId: activeWorkerRequest ? activeWorkerRequest.requestId : 0,
+      projectionRevision,
+      sourceRevision
+    };
+  }
+
+  function setWorkerEnabled(enabled) {
+    workerPreferred = !!enabled;
+    try {
+      localStorage.setItem('webrxWaterfallWorker', workerPreferred ? '1' : '0');
+    } catch (_) {}
+    if (!workerPreferred) terminateWorker(false);
+    else workerDisabled = false;
+    markProjectionDirty('worker-mode');
+    schedulePresent();
+    return workerSnapshot();
+  }
+
+  function ensureProjectionBuffer(geometry, clearNew = true) {
+    const requiredBytes = geometry.width * geometry.height * 4;
+    const changed = !rgbaHistory || rgbaHistory.length !== requiredBytes ||
+      projectedWidth !== geometry.width || projectedHeight !== geometry.height;
+    if (changed) {
+      rgbaHistory = new Uint8ClampedArray(requiredBytes);
+      if (clearNew) opaqueBlack(rgbaHistory);
+    }
+    projectedWidth = geometry.width;
+    projectedHeight = geometry.height;
+    rowBytes = projectedWidth * 4;
+    return changed;
+  }
+
+  function getProjectionWorker() {
+    if (!workerSupported()) return null;
+    if (workerInstance) return workerInstance;
+    try {
+      workerInstance = new Worker(WATERFALL_WORKER_URL);
+      workerInstance.onmessage = handleWorkerMessage;
+      workerInstance.onerror = (event) => {
+        console.warn('[WEBRX-WORKER] Waterfall worker failed; using synchronous fallback.', event && event.message ? event.message : event);
+        WebRxDiagnostics.markWaterfallWorkerFailure();
+        terminateWorker(true);
+        markProjectionDirty('worker-error-fallback');
+        schedulePresent();
+      };
+      console.info('[WEBRX-WORKER] Waterfall projection worker enabled:', WATERFALL_WORKER_URL);
+      return workerInstance;
+    } catch (error) {
+      console.warn('[WEBRX-WORKER] Unable to start waterfall worker; using synchronous fallback.', error);
+      WebRxDiagnostics.markWaterfallWorkerFailure();
+      terminateWorker(true);
+      return null;
+    }
+  }
+
+  function opaqueBlack(buffer) {
+    if (!buffer) return;
+    buffer.fill(0);
+    for (let i = 3; i < buffer.length; i += 4) buffer[i] = 255;
+  }
+
+  function getCanvas() {
+    if (!canvas || !canvas.isConnected) {
+      canvas = document.getElementById("waterfall");
+      ctx = canvas ? canvas.getContext("2d", { alpha: false }) : null;
+    }
+    return canvas;
+  }
+
+  function currentAcquisitionKey(bins) {
+    return [
+      ReceiverState.centerHz,
+      ReceiverState.sampleRateHz,
+      ReceiverState.fftSize,
+      bins
+    ].join("|");
+  }
+
+  function ensureCanvasGeometry() {
+    const target = getCanvas();
+    if (!target || !ctx) return null;
+
+    const displayWidth = Math.max(
+      1,
+      Math.round(target.clientWidth || target.offsetWidth || target.width || 1)
+    );
+    const displayHeight = Math.max(
+      1,
+      Math.round(target.clientHeight || target.offsetHeight || target.height || 1)
+    );
+
+    if (target.width !== displayWidth) {
+      target.width = displayWidth;
+      // Assigning width resets context state.
+      ctx = target.getContext("2d", { alpha: false });
+      markProjectionDirty("canvas-width");
+    }
+
+    if (capacityRows > 0 && capacityRows !== displayHeight && sourceHistory && sourceBins > 0) {
+      resizeHistoryCapacity(displayHeight);
+    } else if (capacityRows === 0) {
+      capacityRows = displayHeight;
+    }
+
+    if (projectedWidth !== target.width || projectedHeight !== displayHeight) {
+      projectedWidth = target.width;
+      projectedHeight = displayHeight;
+      rowBytes = projectedWidth * 4;
+      markProjectionDirty("view-geometry");
+    }
+
+    return { width: target.width, height: displayHeight };
+  }
+
+  function allocateSourceHistory(bins, rows, markReset = true) {
+    sourceBins = Math.max(1, bins | 0);
+    capacityRows = Math.max(1, rows | 0);
+    sourceHistory = new Float32Array(sourceBins * capacityRows);
+    headRow = 0;
+    rowsWritten = 0;
+    acquisitionKey = currentAcquisitionKey(sourceBins);
+    sourceRevision++;
+    markProjectionDirty("acquisition");
+    if (markReset) WebRxDiagnostics.markWaterfallReset();
+  }
+
+  function resizeHistoryCapacity(newCapacity) {
+    newCapacity = Math.max(1, newCapacity | 0);
+    if (!sourceHistory || sourceBins <= 0 || capacityRows <= 0) {
+      capacityRows = newCapacity;
+      sourceRevision++;
+      markProjectionDirty("history-capacity");
+      return;
+    }
+    if (newCapacity === capacityRows) return;
+
+    const oldHistory = sourceHistory;
+    const oldCapacity = capacityRows;
+    const oldHead = headRow;
+    const copyRows = Math.min(rowsWritten, newCapacity);
+    const next = new Float32Array(sourceBins * newCapacity);
+
+    // Preserve newest -> oldest order, independent of the old physical ring.
+    for (let logicalRow = 0; logicalRow < copyRows; logicalRow++) {
+      const oldPhysical = (oldHead + logicalRow) % oldCapacity;
+      const srcStart = oldPhysical * sourceBins;
+      const dstStart = logicalRow * sourceBins;
+      next.set(oldHistory.subarray(srcStart, srcStart + sourceBins), dstStart);
+    }
+
+    sourceHistory = next;
+    capacityRows = newCapacity;
+    headRow = 0;
+    rowsWritten = copyRows;
+    sourceRevision++;
+    markProjectionDirty("history-capacity");
+  }
+
+  function ensureSourceHistory(line) {
+    const geometry = ensureCanvasGeometry();
+    if (!geometry || !line || line.length <= 0) return false;
+
+    const bins = line.length | 0;
+    const key = currentAcquisitionKey(bins);
+    if (!sourceHistory || sourceBins !== bins || acquisitionKey !== key) {
+      allocateSourceHistory(bins, geometry.height, true);
+    } else if (capacityRows !== geometry.height) {
+      resizeHistoryCapacity(geometry.height);
+    }
+    return true;
+  }
+
+  function fallbackPaletteRgb(index) {
+    // Compact SDR-style fallback used only until AstraRX sends waterfall_colors.
+    // Piecewise interpolation keeps the legacy/server palette authoritative.
+    const stops = [
+      [0.00, 0x000000],
+      [0.18, 0x00124d],
+      [0.38, 0x006cff],
+      [0.56, 0x00d9c8],
+      [0.72, 0x7dff00],
+      [0.86, 0xffd200],
+      [0.95, 0xff3b00],
+      [1.00, 0xffffff]
+    ];
+    const t = Math.max(0, Math.min(1, index / (COLOR_LUT_SIZE - 1)));
+    let a = stops[0];
+    let b = stops[stops.length - 1];
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        a = stops[i - 1];
+        b = stops[i];
+        break;
+      }
+    }
+    const span = Math.max(1e-9, b[0] - a[0]);
+    const u = (t - a[0]) / span;
+    const ar = (a[1] >> 16) & 0xff, ag = (a[1] >> 8) & 0xff, ab = a[1] & 0xff;
+    const br = (b[1] >> 16) & 0xff, bg = (b[1] >> 8) & 0xff, bb = b[1] & 0xff;
+    const r = Math.round(ar + (br - ar) * u);
+    const g = Math.round(ag + (bg - ag) * u);
+    const bl = Math.round(ab + (bb - ab) * u);
+    return (r << 16) | (g << 8) | bl;
+  }
+
+  function rebuildPaletteLut() {
+    const source = Array.isArray(waterfallColorMap) ? waterfallColorMap : [];
+    const sourceCount = source.length;
+    for (let i = 0; i < COLOR_LUT_SIZE; i++) {
+      let rgb;
+      if (sourceCount > 0) {
+        const srcIndex = sourceCount === 1
+          ? 0
+          : Math.max(0, Math.min(sourceCount - 1, Math.round(i * (sourceCount - 1) / (COLOR_LUT_SIZE - 1))));
+        rgb = Number(source[srcIndex]);
+        if (!Number.isFinite(rgb)) rgb = 0;
+      } else {
+        rgb = fallbackPaletteRgb(i);
+      }
+      const dst = i * 4;
+      colorLut[dst] = (rgb >> 16) & 0xff;
+      colorLut[dst + 1] = (rgb >> 8) & 0xff;
+      colorLut[dst + 2] = rgb & 0xff;
+      colorLut[dst + 3] = 255;
+    }
+    paletteRevisionSeen = waterfallPaletteRevision;
+    WebRxDiagnostics.markWaterfallPaletteRebuild();
+  }
+
+  function rebuildDbColorIndexLut(minDb, maxDb) {
+    const rangeDb = Math.max(1e-6, maxDb - minDb);
+    for (let i = 0; i < DB_LUT_SIZE; i++) {
+      const db = DB_LUT_MIN + i * DB_LUT_STEP;
+      const norm = Math.max(0, Math.min(1, (db - minDb) / rangeDb));
+      dbToColorIndexLut[i] = Math.max(0, Math.min(255, Math.round(norm * 255)));
+    }
+    colorRangeMinDb = minDb;
+    colorRangeMaxDb = maxDb;
+  }
+
+  function ensureColorMapping() {
+    if (paletteRevisionSeen !== waterfallPaletteRevision) rebuildPaletteLut();
+    const range = WaterfallIntensity.getEffectiveRange();
+    if (range.minDb !== colorRangeMinDb || range.maxDb !== colorRangeMaxDb) {
+      rebuildDbColorIndexLut(range.minDb, range.maxDb);
+    }
+    return range;
+  }
+
+  function sourceValueForPixel(physicalRow, x, width, visibleRange) {
+    if (!sourceHistory || sourceBins <= 0) {
+      return Number.isFinite(colorRangeMinDb) ? colorRangeMinDb : waterfallMinDb;
+    }
+    const rowOffset = physicalRow * sourceBins;
+    const range = visibleRange || FrequencyViewTransform.visibleBinRange(sourceBins);
+    const startBin = Math.max(0, Math.min(sourceBins - 1, range.start | 0));
+    const endBin = Math.max(startBin + 1, Math.min(sourceBins, range.end | 0));
+    const visibleBins = endBin - startBin;
+
+    if (visibleBins <= 1 || width <= 1) {
+      const value = sourceHistory[rowOffset + startBin];
+      return Number.isFinite(value) ? value : waterfallMinDb;
+    }
+
+    if (visibleBins <= width) {
+      const src = startBin + Math.min(
+        visibleBins - 1,
+        Math.max(0, Math.round((x / (width - 1)) * (visibleBins - 1)))
+      );
+      const value = sourceHistory[rowOffset + src];
+      return Number.isFinite(value) ? value : waterfallMinDb;
+    }
+
+    const binsPerPixel = visibleBins / width;
+    const localStart = Math.floor(x * binsPerPixel);
+    const localEnd = Math.max(
+      localStart + 1,
+      Math.min(visibleBins, Math.floor((x + 1) * binsPerPixel))
+    );
+    let peak = -Infinity;
+    for (let local = localStart; local < localEnd; local++) {
+      const value = sourceHistory[rowOffset + startBin + local];
+      if (Number.isFinite(value) && value > peak) peak = value;
+    }
+    return Number.isFinite(peak) ? peak : waterfallMinDb;
+  }
+
+  function writeColor(dst, rawDb) {
+    const finiteDb = Number.isFinite(rawDb) ? rawDb : colorRangeMinDb;
+    const dbIndex = Math.max(0, Math.min(
+      DB_LUT_SIZE - 1,
+      Math.round((finiteDb - DB_LUT_MIN) / DB_LUT_STEP)
+    ));
+    const paletteIndex = dbToColorIndexLut[dbIndex] * 4;
+    rgbaHistory[dst] = colorLut[paletteIndex];
+    rgbaHistory[dst + 1] = colorLut[paletteIndex + 1];
+    rgbaHistory[dst + 2] = colorLut[paletteIndex + 2];
+    rgbaHistory[dst + 3] = 255;
+  }
+
+  function projectPhysicalRow(physicalRow, visibleRange) {
+    if (!rgbaHistory || projectedWidth <= 0 || physicalRow < 0 || physicalRow >= capacityRows) return;
+    const rowOffset = physicalRow * rowBytes;
+    for (let x = 0; x < projectedWidth; x++) {
+      writeColor(
+        rowOffset + x * 4,
+        sourceValueForPixel(physicalRow, x, projectedWidth, visibleRange)
+      );
+    }
+  }
+
+  function handleWorkerMessage(event) {
+    const message = event && event.data ? event.data : {};
+    const request = activeWorkerRequest;
+
+    if (message.type === "worker-error") {
+      if (!request || message.requestId === request.requestId) {
+        console.warn("[WEBRX-WORKER] Waterfall projection task failed; falling back to main thread.", message.error || "unknown worker error");
+        WebRxDiagnostics.markWaterfallWorkerFailure();
+        terminateWorker(true);
+        markProjectionDirty("worker-task-fallback");
+        schedulePresent();
+      }
+      return;
+    }
+
+    if (message.type !== "waterfall-projected") return;
+    if (!request || message.requestId !== request.requestId) {
+      WebRxDiagnostics.markWaterfallWorkerDiscard();
+      return;
+    }
+
+    workerBusy = false;
+    activeWorkerRequest = null;
+    WebRxDiagnostics.markWaterfallWorkerCompletion(message.elapsedMs);
+
+    const stillCurrent =
+      request.projectionRevision === projectionRevision &&
+      request.acquisitionEpoch === ReceiverState.acquisitionEpoch &&
+      request.acquisitionKey === acquisitionKey &&
+      request.width === projectedWidth &&
+      request.height === projectedHeight &&
+      request.sourceBins === sourceBins &&
+      request.capacityRows === capacityRows;
+
+    if (!stillCurrent) {
+      WebRxDiagnostics.markWaterfallWorkerDiscard();
+      schedulePresent();
+      return;
+    }
+
+    const result = new Uint8ClampedArray(message.rgba);
+    const expectedBytes = projectedWidth * projectedHeight * 4;
+    if (result.length !== expectedBytes) {
+      console.warn("[WEBRX-WORKER] Invalid waterfall projection size; using synchronous fallback.");
+      WebRxDiagnostics.markWaterfallWorkerFailure();
+      terminateWorker(true);
+      markProjectionDirty("worker-size-fallback");
+      schedulePresent();
+      return;
+    }
+
+    const sourceDelta = Math.max(0, sourceRevision - request.sourceRevision);
+    if (sourceDelta >= capacityRows) {
+      // The entire ring changed while the worker was projecting. Applying this
+      // snapshot would resurrect stale history, so request a fresh rebuild.
+      WebRxDiagnostics.markWaterfallWorkerDiscard();
+      markProjectionDirty("worker-source-overrun");
+      schedulePresent();
+      return;
+    }
+
+    rgbaHistory = result;
+    rowBytes = projectedWidth * 4;
+    projectionDirty = false;
+    projectionReason = "";
+
+    // Source FFT rows may continue arriving while the worker operates. Catch up
+    // only those newest physical rows on the main thread instead of discarding
+    // an otherwise valid full-history projection.
+    if (sourceDelta > 0 && sourceHistory) {
+      ensureColorMapping();
+      const visibleRange = FrequencyViewTransform.visibleBinRange(sourceBins);
+      for (let i = 0; i < sourceDelta; i++) {
+        const physicalRow = (headRow + i) % capacityRows;
+        projectPhysicalRow(physicalRow, visibleRange);
+      }
+    }
+
+    schedulePresent();
+  }
+
+  function startWorkerProjection(geometry) {
+    if (!sourceHistory || rowsWritten <= 0) return false;
+    if (geometry.width * geometry.height < RuntimePerformancePolicy.getWaterfallWorkerMinPixels()) return false;
+
+    const worker = getProjectionWorker();
+    if (!worker) return false;
+    if (workerBusy) return true;
+
+    ensureColorMapping();
+    ensureProjectionBuffer(geometry, false);
+    const visibleRange = FrequencyViewTransform.visibleBinRange(sourceBins);
+
+    // The source ring remains owned by the UI thread. Copy only when a full
+    // re-projection is actually required, then transfer that snapshot so the
+    // worker can process it without an additional structured-clone copy.
+    const sourceSnapshot = new Float32Array(sourceHistory);
+    const colorSnapshot = new Uint8ClampedArray(colorLut);
+    const indexSnapshot = new Uint8Array(dbToColorIndexLut);
+    const copiedBytes = sourceSnapshot.byteLength + colorSnapshot.byteLength + indexSnapshot.byteLength;
+    const requestId = ++workerRequestSerial;
+    const request = {
+      requestId,
+      projectionRevision,
+      sourceRevision,
+      acquisitionEpoch: ReceiverState.acquisitionEpoch,
+      acquisitionKey,
+      width: geometry.width,
+      height: geometry.height,
+      sourceBins,
+      capacityRows,
+      rowsWritten,
+      headRow
+    };
+
+    workerBusy = true;
+    activeWorkerRequest = request;
+    WebRxDiagnostics.markWaterfallWorkerRequest(copiedBytes);
+
+    try {
+      worker.postMessage({
+        type: "waterfall-project",
+        ...request,
+        visibleStart: visibleRange.start,
+        visibleEnd: visibleRange.end,
+        dbLutMin: DB_LUT_MIN,
+        dbLutStep: DB_LUT_STEP,
+        fallbackDb: Number.isFinite(colorRangeMinDb) ? colorRangeMinDb : waterfallMinDb,
+        sourceHistory: sourceSnapshot.buffer,
+        colorLut: colorSnapshot.buffer,
+        dbToColorIndexLut: indexSnapshot.buffer
+      }, [sourceSnapshot.buffer, colorSnapshot.buffer, indexSnapshot.buffer]);
+      return true;
+    } catch (error) {
+      console.warn("[WEBRX-WORKER] Failed to queue waterfall projection; using synchronous fallback.", error);
+      WebRxDiagnostics.markWaterfallWorkerFailure();
+      terminateWorker(true);
+      return false;
+    }
+  }
+
+  function rebuildProjection() {
+    const geometry = ensureCanvasGeometry();
+    if (!geometry) return false;
+
+    const changedGeometry = ensureProjectionBuffer(geometry, true);
+    ensureColorMapping();
+
+    if (sourceHistory && rowsWritten > 0 && startWorkerProjection(geometry)) {
+      // Keep the previous same-sized projection visible while the worker is
+      // running. Geometry changes allocate an opaque-black cache until ready.
+      return true;
+    }
+
+    if (!changedGeometry) opaqueBlack(rgbaHistory);
+    if (sourceHistory && rowsWritten > 0) {
+      const visibleRange = FrequencyViewTransform.visibleBinRange(sourceBins);
+      for (let logicalRow = 0; logicalRow < rowsWritten; logicalRow++) {
+        const physicalRow = (headRow + logicalRow) % capacityRows;
+        projectPhysicalRow(physicalRow, visibleRange);
+      }
+    }
+
+    projectionDirty = false;
+    projectionReason = "";
+    return true;
+  }
+
+  function ensureProjection() {
+    const geometry = ensureCanvasGeometry();
+    if (!geometry) return false;
+    const requiredBytes = geometry.width * geometry.height * 4;
+    if (projectionDirty || !rgbaHistory || rgbaHistory.length !== requiredBytes) {
+      return rebuildProjection();
+    }
+    return true;
+  }
+
+  function onIntensityRangeChanged(intensity) {
+    if (!intensity || !intensity.rangeChanged) return;
+    // Refresh the cheap dB/color lookup immediately so the newest row follows
+    // the current auto range. Rebuild older history at a bounded cadence only.
+    ensureColorMapping();
+    if (!projectionDirty && rgbaHistory && sourceHistory && rowsWritten > 0) {
+      projectPhysicalRow(headRow, FrequencyViewTransform.visibleBinRange(sourceBins));
+    }
+    const now = webRxNowMs();
+    if (intensity.reprojectSuggested &&
+        now - lastIntensityProjectionMs >= WaterfallIntensity.getReprojectMinIntervalMs()) {
+      markProjectionDirty("auto-intensity");
+      lastIntensityProjectionMs = now;
+      WebRxDiagnostics.markWaterfallIntensityReproject();
+      schedulePresent();
+    }
+  }
+
+  function writeRow(line) {
+    if (!ensureSourceHistory(line)) return false;
+    const startMs = webRxNowMs();
+    const visibleRange = FrequencyViewTransform.visibleBinRange(sourceBins);
+    const intensity = WaterfallIntensity.observeFFT(line, visibleRange);
+    onIntensityRangeChanged(intensity);
+
+    headRow = (headRow - 1 + capacityRows) % capacityRows;
+    const dst = headRow * sourceBins;
+    if (line instanceof Float32Array && line.length === sourceBins) {
+      sourceHistory.set(line, dst);
+    } else {
+      const fallbackDb = WaterfallIntensity.getEffectiveRange().minDb;
+      for (let i = 0; i < sourceBins; i++) {
+        const value = Number(line[i]);
+        sourceHistory[dst + i] = Number.isFinite(value) ? value : fallbackDb;
+      }
+    }
+    rowsWritten = Math.min(capacityRows, rowsWritten + 1);
+    sourceRevision++;
+
+    // If the current projection is valid, update only the newest physical row.
+    // A zoom/resize/range change marks it dirty and triggers one full rebuild.
+    if (ensureProjection() && !projectionDirty) {
+      projectPhysicalRow(headRow, visibleRange);
+    }
+
+    WebRxDiagnostics.markWaterfallRow(webRxNowMs() - startMs);
+    return true;
+  }
+
+  function present() {
+    framePending = false;
+    if (!waterfallEnabled || !ensureProjection() || !ctx || !rgbaHistory) return;
+
+    const startMs = webRxNowMs();
+    const firstRows = capacityRows - headRow;
+    if (firstRows > 0) {
+      const firstOffset = headRow * rowBytes;
+      const firstLength = firstRows * rowBytes;
+      const firstView = rgbaHistory.subarray(firstOffset, firstOffset + firstLength);
+      ctx.putImageData(new ImageData(firstView, projectedWidth, firstRows), 0, 0);
+    }
+
+    if (headRow > 0) {
+      const secondRows = headRow;
+      const secondLength = secondRows * rowBytes;
+      const secondView = rgbaHistory.subarray(0, secondLength);
+      ctx.putImageData(new ImageData(secondView, projectedWidth, secondRows), 0, firstRows);
+    }
+
+    WebRxDiagnostics.markWaterfallPresented(webRxNowMs() - startMs);
+  }
+
+  function schedulePresent() {
+    if (framePending) {
+      WebRxDiagnostics.markWaterfallCoalesced();
+      return;
+    }
+    framePending = true;
+    requestAnimationFrame(present);
+  }
+
+  function pushFFT(line) {
+    if (!waterfallEnabled) return;
+    if (writeRow(line)) schedulePresent();
+  }
+
+  function invalidateProjection(reason = "view") {
+    markProjectionDirty(reason);
+    schedulePresent();
+  }
+
+  function onViewGeometryChanged() {
+    const beforeRows = rowsWritten;
+    ensureCanvasGeometry();
+    markProjectionDirty("view-geometry");
+    schedulePresent();
+    return beforeRows;
+  }
+
+  function onAcquisitionChanged() {
+    acquisitionKey = "";
+    sourceBins = 0;
+    sourceHistory = null;
+    headRow = 0;
+    rowsWritten = 0;
+    rgbaHistory = null;
+    sourceRevision++;
+    markProjectionDirty("acquisition-change");
+    colorRangeMinDb = NaN;
+    colorRangeMaxDb = NaN;
+    lastIntensityProjectionMs = 0;
+    WaterfallIntensity.resetAuto(false);
+    WebRxDiagnostics.markWaterfallReset();
+
+    const geometry = ensureCanvasGeometry();
+    if (geometry && ctx) {
+      ctx.fillStyle = "rgb(0,0,0)";
+      ctx.fillRect(0, 0, geometry.width, geometry.height);
+    }
+  }
+
+  function clear(options = {}) {
+    ensureCanvasGeometry();
+    if (sourceHistory) sourceHistory.fill(0);
+    if (rgbaHistory) opaqueBlack(rgbaHistory);
+    headRow = 0;
+    rowsWritten = 0;
+    sourceRevision++;
+    markProjectionDirty("clear");
+    // The black cache already represents the cleared source state. Keep it
+    // valid while any older worker request drains and is rejected by revision.
+    projectionDirty = false;
+    projectionReason = "";
+    WebRxDiagnostics.markWaterfallReset();
+
+    if (options.present !== false && ctx && projectedWidth > 0 && projectedHeight > 0) {
+      ctx.fillStyle = "rgb(0,0,0)";
+      ctx.fillRect(0, 0, projectedWidth, projectedHeight);
+    }
+  }
+
+  function resetForCanvasResize() {
+    // Backward-compatible alias: Phase E no longer destroys RF history.
+    onViewGeometryChanged();
+  }
+
+  function snapshot() {
+    const view = FrequencyViewTransform.getViewSnapshot();
+    const visible = FrequencyViewTransform.visibleBinRange(sourceBins);
+    return {
+      sourceBins,
+      visibleBins: visible.count,
+      capacityRows,
+      rowsWritten,
+      headRow,
+      acquisitionKey,
+      acquisitionEpoch: ReceiverState.acquisitionEpoch,
+      projectedWidth,
+      projectedHeight,
+      sourceBytes: sourceHistory ? sourceHistory.byteLength : 0,
+      projectionBytes: rgbaHistory ? rgbaHistory.byteLength : 0,
+      projectionDirty,
+      projectionReason,
+      projectionRevision,
+      sourceRevision,
+      framePending,
+      worker: workerSnapshot(),
+      intensity: WaterfallIntensity.snapshot(),
+      paletteEntries: waterfallColorMap.length,
+      paletteRevision: waterfallPaletteRevision,
+      colorLutBytes: colorLut.byteLength + dbToColorIndexLut.byteLength,
+      viewCenterHz: view.viewCenterHz,
+      viewSpanHz: view.viewSpanHz,
+      viewZoom: view.zoom
+    };
+  }
+
+  return {
+    pushFFT,
+    clear,
+    present,
+    invalidateProjection,
+    onViewGeometryChanged,
+    onAcquisitionChanged,
+    onIntensityRangeChanged,
+    resetForCanvasResize,
+    setWorkerEnabled,
+    snapshot
+  };
+})();
+window.WaterfallEngine = WaterfallEngine;
+window.setWaterfallWorkerEnabled = (enabled) => WaterfallEngine.setWorkerEnabled(enabled);
+
+function drawWaterfallLine(line) {
+  WaterfallEngine.pushFFT(line);
 }
 
 // === DRAW ANALOG S-METER ===
@@ -707,8 +4190,16 @@ function drawSMeter(value) {
 // === HANDLE FFT JSON ===
 function handleNewFFTJson(jsonFFT) {
   latestFFT = normalizeFFTData(jsonFFT);
+  spectrumSourceRevision++;
   const data = latestFFT;
-  drawSpectrum(data);
+  WebRxDiagnostics.markFFTSource();
+  updateMaxHoldFromSource(data);
+
+  // Latest-frame-wins for the spectrum: never build a render backlog.
+  scheduleSpectrumFrame();
+
+  // Every source FFT advances waterfall history exactly once. The Phase D
+  // engine presents at browser refresh cadence without dropping source rows.
   drawWaterfallLine(data);
 
   if (mode != getPreferredTheme()) {
@@ -745,9 +4236,7 @@ window.addEventListener("resize", drawScale);
 window.onload = drawScale;
 
 function drawOverlayLine(ctx, width, height) {
-  const freqStart     = center_freq - bandwidth / 2;
-  const freqRange     = bandwidth;
-  const offsetFreqAbs = center_freq + offsetFrequency;
+  const offsetFreqAbs = ReceiverState.centerHz + ReceiverState.offsetHz;
 
   const lowInput  = document.getElementById("lowCutInput");
   const highInput = document.getElementById("highCutInput");
@@ -790,9 +4279,9 @@ function drawOverlayLine(ctx, width, height) {
 
   const demodBandwidth = high_cut - low_cut;
 
-  const xCenter = ((offsetFreqAbs - freqStart) / freqRange) * width;
-  const xLeft   = ((offsetFreqAbs - demodBandwidth / 2 - freqStart) / freqRange) * width;
-  const xRight  = ((offsetFreqAbs + demodBandwidth / 2 - freqStart) / freqRange) * width;
+  const xCenter = FrequencyViewTransform.frequencyToCanvasX(offsetFreqAbs, width);
+  const xLeft   = FrequencyViewTransform.frequencyToCanvasX(offsetFreqAbs - demodBandwidth / 2, width);
+  const xRight  = FrequencyViewTransform.frequencyToCanvasX(offsetFreqAbs + demodBandwidth / 2, width);
 
   // shaded region for demod bandwidth
   if (mode === "dark")
@@ -819,114 +4308,62 @@ function setupOverlayMouse(canvas, applyOffsetCallback) {
   let dragging = false;
   let dragX = 0;
 
+  function finishDrag(reason) {
+    if (!dragging) return;
+    dragging = false;
+    FrequencyController.flushPendingOffset(reason);
+  }
+
   canvas.addEventListener('mousedown', (e) => {
     const x = e.offsetX;
     const canvasWidth = canvas.width;
-    const freqStart = center_freq - bandwidth / 2;
-    const freqRange = bandwidth;
-    const offsetFreqAbs = center_freq + offsetFrequency;
-    const targetX = ((offsetFreqAbs - freqStart) / freqRange) * canvasWidth;
+    const offsetFreqAbs = ReceiverState.centerHz + ReceiverState.offsetHz;
+    const targetX = FrequencyViewTransform.frequencyToCanvasX(offsetFreqAbs, canvasWidth);
 
     if (Math.abs(x - targetX) < 10) {
       dragging = true;
       dragX = x;
     } else {
-      const clickedFreq = freqStart + (x / canvasWidth) * freqRange;
-      let newOffset = clickedFreq - center_freq;
+      const clickedFreq = FrequencyViewTransform.canvasXToFrequency(x, canvasWidth);
+      let newOffset = clickedFreq - ReceiverState.centerHz;
       newOffset = Math.round(newOffset / offsetSnapStep) * offsetSnapStep;
-      offsetFrequency = Math.max(-bandwidth / 2, Math.min(bandwidth / 2, newOffset));
-      applyOffsetCallback(offsetFrequency);
-      const freqInput = document.getElementById("manualFreqInput");
-      // if (freqInput && document.activeElement !== freqInput) 
-      freqInput.value = ((center_freq + offsetFrequency) / 1e6).toFixed(6);
-      sendMessageToServer({
-        type: "dspcontrol",
-        params: { offset_freq: Math.round(offsetFrequency) }
-      });
+      FrequencyController.requestOffsetHz(newOffset, "spectrum.click");
+      if (typeof applyOffsetCallback === "function") applyOffsetCallback(ReceiverState.offsetHz);
     }
   });
 
-  canvas.addEventListener('mouseup', () => { dragging = false; });
-  canvas.addEventListener('mouseleave', () => { dragging = false; });
+  canvas.addEventListener('mouseup', () => finishDrag("spectrum.drag.final"));
+  canvas.addEventListener('mouseleave', () => finishDrag("spectrum.drag.leave"));
+  window.addEventListener('blur', () => finishDrag("spectrum.drag.blur"));
 
   canvas.addEventListener('mousemove', (e) => {
     if (!dragging) return;
     const x = e.offsetX;
     const deltaX = x - dragX;
     dragX = x;
-    const deltaFreq = (deltaX / canvas.width) * bandwidth;
-    let newOffset = offsetFrequency + deltaFreq;
+    const deltaFreq = deltaX * FrequencyViewTransform.hzPerCanvasPixel(canvas.width);
+    let newOffset = ReceiverState.offsetHz + deltaFreq;
     newOffset = Math.round(newOffset / offsetSnapStep) * offsetSnapStep;
-    offsetFrequency = Math.max(-bandwidth / 2, Math.min(bandwidth / 2, newOffset));
-    applyOffsetCallback(offsetFrequency);
-    const freqInput = document.getElementById("manualFreqInput");
-    // if (freqInput && document.activeElement !== freqInput) 
-    freqInput.value = ((center_freq + offsetFrequency) / 1e6).toFixed(6);
-    sendMessageToServer({
-      type: "dspcontrol",
-      params: { offset_freq: Math.round(offsetFrequency) }
-    });
-
+    FrequencyController.requestOffsetHz(newOffset, "spectrum.drag", { coalesce: true });
+    if (typeof applyOffsetCallback === "function") applyOffsetCallback(ReceiverState.offsetHz);
   });
-
 }
 
-function setOffset() {
+function setOffset(reason = "manual.change") {
   const freqInput = document.getElementById("manualFreqInput");
-  if (!freqInput) return;
+  if (!freqInput) return false;
 
-  var val = freqInput.value
+  let mhz = parseFloat(freqInput.value);
+  if (!Number.isFinite(mhz)) return false;
 
-  if (val < 30) val = freqInput.min;
-  if (val > 3200) val = freqInput.max;
-  freqInput.value = val
+  const minMHz = Number.isFinite(Number(freqInput.min)) ? Number(freqInput.min) : (RECEIVER_MIN_HZ / 1e6);
+  const maxMHz = Number.isFinite(Number(freqInput.max)) ? Number(freqInput.max) : (RECEIVER_MAX_HZ / 1e6);
+  mhz = Math.max(minMHz, Math.min(maxMHz, mhz));
+  freqInput.value = mhz.toFixed(6);
 
-  const freq_to_set = parseFloat(freqInput.value) * 1e6;
-
-  if (isNaN(freq_to_set)) return;
-
-  freqInput.value = parseFloat(freqInput.value).toFixed(6)
-
-  const minAllowed = center_freq - bandwidth / 2;
-  const maxAllowed = center_freq + bandwidth / 2;
-
-  if (freq_to_set < minAllowed || freq_to_set > maxAllowed) {
-    // outside current visible range → set center_freq
-    center_freq = freq_to_set;
-    offsetFrequency = 0;
-
-    sendMessageToServer({
-      type: "setfrequency",
-      params: {
-        frequency: center_freq,
-        key: "memagic"
-      }
-    });
-
-    // Delay Max Hold Reset by 200ms
-    if (maxHoldResetTimer) clearTimeout(maxHoldResetTimer);
-    maxHoldResetTimer = setTimeout(() => {
-      maxHoldData = [];
-    }, 500);
-
-  } else {
-    // valid range → adjust offset
-    offsetFrequency = freq_to_set - center_freq;
-    offsetFrequency = Math.max(-bandwidth / 2, Math.min(bandwidth / 2, offsetFrequency));
-
-    sendMessageToServer({
-      type: "dspcontrol",
-      params: {
-        offset_freq: Math.round(offsetFrequency)
-      }
-    });
-  }
-
-  drawScale();
-  const fftValues = getLatestFFTData();
-  drawSpectrum(fftValues);
-  drawWaterfallLine(fftValues);
+  return FrequencyController.requestReceiverHz(mhz * 1e6, reason);
 }
+window.setOffset = setOffset;
 
 window.addEventListener('DOMContentLoaded', () => {
   const freqInput = document.getElementById("manualFreqInput");
@@ -934,57 +4371,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   if (freqInput && freqBtn) {
     freqBtn.addEventListener('click', () => {
-
-      // ✔ อ่านค่าจาก input (MHz)
-      const raw = (freqInput.value || "").trim();
-      const newFreqHz = parseFloat(raw) * 1e6;   // MHz → Hz
-
-      if (isNaN(newFreqHz)) {
-        console.warn("manualFreqInput: invalid input:", raw);
-        return;
-      }
-
-      // ===== เงื่อนไขเดียวกับ QML =====
-      // QML: if ((centerFreq+offsetFrequency) > (centerFreq+(sampRate/2)) || ...)
-      // ที่นี่ใช้ bandwidth แทน sampRate
-      const halfBw = bandwidth / 2;
-
-      if (newFreqHz > center_freq + halfBw || newFreqHz < center_freq - halfBw) {
-        // 👉 นอกแบนด์: ขยับ center_freq ไปที่ความถี่ใหม่, offset = 0
-        center_freq = newFreqHz;
-        offsetFrequency = 0;
-
-        // อัปเดตกล่อง input ให้ตรงกับ center ใหม่
-        freqInput.value = (center_freq / 1e6).toFixed(6);
-
-        // ส่ง setfrequency ไป server
-        sendMessageToServer({
-          type: "setfrequency",
-          params: {
-            frequency: Math.round(center_freq),
-            key: "memagic"
-          }
-        });
-
-      } else {
-        // 👉 ยังอยู่ในแบนด์: เปลี่ยน offset อย่างเดียว
-        offsetFrequency = newFreqHz - center_freq;
-
-        // อัปเดตกล่อง input ให้เป็น (center + offset)
-        freqInput.value = ((center_freq + offsetFrequency) / 1e6).toFixed(6);
-
-        // ส่ง dspcontrol offset_freq ไป server
-        sendMessageToServer({
-          type: "dspcontrol",
-          params: { offset_freq: Math.round(offsetFrequency) }
-        });
-      }
-
-      // ✔ วาดกราฟใหม่
-      const fftValues = getLatestFFTData();
-      drawScale();
-      drawSpectrum(fftValues);
-      drawWaterfallLine(fftValues);
+      setOffset("manual.button");
     });
 
   } else {
@@ -993,11 +4380,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // ✔ overlay mouse control (ของเดิม)
   const overlayCanvas = document.getElementById("spectrum-plot");
-  setupOverlayMouse(overlayCanvas, (newOffset) => {
-    const fftValues = getLatestFFTData();
-    drawScale();
-    drawSpectrum(fftValues);
-    drawWaterfallLine(fftValues);
+  setupOverlayMouse(overlayCanvas, () => {
+    // FrequencyController already schedules the spectrum redraw. Waterfall
+    // history only advances on a real incoming FFT frame.
   });
 });
 
@@ -1092,7 +4477,17 @@ function setupSliders() {
   dbSlider.noUiSlider.on('update', (values) => {
     waterfallMinDb = parseInt(values[0]);
     waterfallMaxDb = parseInt(values[1]);
-    dbRangeLabel.textContent = `Min: ${waterfallMinDb} dB Max: ${waterfallMaxDb} dB`;
+    if (typeof WaterfallIntensity !== 'undefined') {
+      WaterfallIntensity.onManualBoundsChanged();
+    } else {
+      dbRangeLabel.textContent = `Min: ${waterfallMinDb} dB Max: ${waterfallMaxDb} dB`;
+    }
+    invalidateSpectrumStaticLayer();
+    scheduleSpectrumFrame();
+    if (typeof WaterfallEngine !== 'undefined' &&
+        typeof WaterfallEngine.invalidateProjection === 'function') {
+      WaterfallEngine.invalidateProjection('db-range');
+    }
   });
 }
 
@@ -1200,8 +4595,9 @@ ImaAdpcmCodec.prototype.decodeNibble = function (nibble) {
   return this.predictor;
 };
 
-// this controls if the new AudioWorklet API should be used if available.
-// the engine will still fall back to the ScriptProcessorNode if this is set to true but not available in the browser.
+// Prefer AudioWorklet where the browser exposes it (normally HTTPS/secure
+// context). The ScriptProcessor fallback remains production-safe for existing
+// HTTP deployments and now follows the same bounded live-edge queue policy.
 var useAudioWorklets = true;
 
 function AudioEngine(maxBufferLength, audioReporter) {
@@ -1210,18 +4606,37 @@ function AudioEngine(maxBufferLength, audioReporter) {
   this.resetStats();
 
   this.onStartCallbacks = [];
-
   this.started = false;
+  this.starting = false;
+  this.audioNode = null;
+  this.gainNode = null;
+  this.engineType = 'not-started';
+  this.volume = 1.0;
+  this.workletStats = null;
+  this.lastWorkletError = '';
+
+  this.latencyProfile = {
+    targetQueueMs: AUDIO_LATENCY_PROFILE.targetQueueMs,
+    startQueueMs: AUDIO_LATENCY_PROFILE.startQueueMs,
+    hardMaxQueueMs: AUDIO_LATENCY_PROFILE.hardMaxQueueMs,
+    statsIntervalMs: AUDIO_LATENCY_PROFILE.statsIntervalMs
+  };
+
+  this.scriptStats = {
+    queuedSamples: 0,
+    underruns: 0,
+    overruns: 0,
+    droppedSamples: 0,
+    playedSamples: 0,
+    silenceSamples: 0,
+    callbacks: 0,
+    prebuffering: true
+  };
+
   this.audioContext = this.buildAudioContext();
-  if (!this.audioContext) {
-    return;
-  }
+  if (!this.audioContext) return;
 
   var me = this;
-  this.audioContext.onstatechange = function () {
-    if (me.audioContext.state !== 'running') return;
-    me._start();
-  }
 
   this.audioCodec = new ImaAdpcmCodec();
   this.compression = 'none';
@@ -1230,184 +4645,233 @@ function AudioEngine(maxBufferLength, audioReporter) {
   this.resampler = new Interpolator(this.resamplingFactor);
   this.hdResampler = new Interpolator(this.hdResamplingFactor);
 
-  this.maxBufferSize = maxBufferLength * this.getSampleRate();
+  // Phase H: this is a hard latency budget, not a one-second backlog.
+  this.targetQueueSamples = this.msToSamples(this.latencyProfile.targetQueueMs);
+  this.startQueueSamples = this.msToSamples(this.latencyProfile.startQueueMs);
+  this.hardMaxQueueSamples = this.msToSamples(this.latencyProfile.hardMaxQueueMs);
+  this.maxBufferSize = this.hardMaxQueueSamples;
+
+  this.audioBuffers = [];
+  this.audioBufferSamples = 0;
 
   this.recorder = new AudioRecorder(this.getOutputRate(), 128);
   this.hdRecorder = new AudioRecorder(this.getHdOutputRate(), 128);
   this.recording = false;
   this.lastHd = false;
+
+  // Install the state callback only after all queue/resampler fields are ready.
+  this.audioContext.onstatechange = function () {
+    if (me.audioContext.state !== 'running') return;
+    me._start();
+  };
+  if (this.audioContext.state === 'running') {
+    setTimeout(function () { me._start(); }, 0);
+  }
 }
+
+AudioEngine.prototype.msToSamples = function (ms) {
+  if (!this.audioContext) return 0;
+  return Math.max(1, Math.round(this.audioContext.sampleRate * Number(ms) / 1000));
+};
 
 AudioEngine.prototype.buildAudioContext = function () {
   var ctxClass = window.AudioContext || window.webkitAudioContext;
-  if (!ctxClass) {
+  if (!ctxClass) return;
+
+  var goodRates = [48000, 44100, 96000];
+  var createContext = function (sampleRate) {
+    var options = { latencyHint: 'interactive' };
+    if (sampleRate) options.sampleRate = sampleRate;
+    return new ctxClass(options);
+  };
+
+  var ctx;
+  try {
+    ctx = createContext();
+    if (goodRates.indexOf(ctx.sampleRate) >= 0) return ctx;
+  } catch (_) {}
+
+  for (var i = 0; i < goodRates.length; i++) {
+    try {
+      if (ctx && typeof ctx.close === 'function') ctx.close();
+      ctx = createContext(goodRates[i]);
+      return ctx;
+    } catch (_) {}
+  }
+
+  try {
+    return createContext();
+  } catch (e) {
+    console.error('[AUDIO] Unable to create AudioContext', e);
     return;
   }
-
-  // known good sample rates
-  var goodRates = [48000, 44100, 96000]
-
-  // let the browser chose the sample rate, if it is good, use it
-  var ctx = new ctxClass({ latencyHint: 'playback' });
-  if (goodRates.indexOf(ctx.sampleRate) >= 0) {
-    return ctx;
-  }
-
-  // if that didn't work, try if any of the good rates work
-  if (goodRates.some(function (sr) {
-    try {
-      ctx = new ctxClass({ sampleRate: sr, latencyHint: 'playback' });
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }, this)) {
-    return ctx;
-  }
-
-  // fallback: let the browser decide
-  // this may cause playback problems down the line
-  return new ctxClass({ latencyHint: 'playback' });
-}
+};
 
 AudioEngine.prototype.resume = function () {
-  this.audioContext.resume();
-}
+  if (!this.audioContext) return Promise.resolve();
+  return this.audioContext.resume();
+};
 
 AudioEngine.prototype._start = function () {
   var me = this;
-
-  // if failed to find a valid resampling factor...
-  if (me.resamplingFactor === 0) {
-    return;
-  }
-
-  // been started before?
-  if (me.started) {
-    return;
-  }
-
-  // are we allowed to play audio?
-  if (!me.isAllowed()) {
-    return;
-  }
-  me.started = true;
+  if (me.resamplingFactor === 0 || me.started || me.starting || !me.isAllowed()) return;
+  me.starting = true;
 
   var runCallbacks = function (workletType) {
+    me.engineType = workletType;
+    me.started = true;
+    me.starting = false;
+    WebRxDiagnostics.markAudioEngineStart(workletType);
     var callbacks = me.onStartCallbacks;
     me.onStartCallbacks = false;
-    callbacks.forEach(function (c) { c(workletType); });
+    if (callbacks) callbacks.forEach(function (c) { c(workletType); });
+    console.info('[AUDIO] Engine =', workletType, me.getLatencySnapshot());
   };
 
   me.gainNode = me.audioContext.createGain();
+  me.gainNode.gain.value = me.volume;
   me.gainNode.connect(me.audioContext.destination);
 
+  var startScriptProcessor = function (reason) {
+    if (reason) console.warn('[AUDIO] AudioWorklet unavailable; using bounded ScriptProcessor fallback:', reason);
+    me.audioBuffers = [];
+    me.audioBufferSamples = 0;
+    me.scriptStats.prebuffering = true;
+
+    if (!AudioBuffer.prototype.copyToChannel) {
+      AudioBuffer.prototype.copyToChannel = function (input, channel) {
+        var cd = this.getChannelData(channel);
+        for (var i = 0; i < input.length; i++) cd[i] = input[i];
+      };
+    }
+
+    var bufferSize;
+    if (me.audioContext.sampleRate < 44100 * 2) bufferSize = 2048;
+    else if (me.audioContext.sampleRate < 44100 * 4) bufferSize = 4096;
+    else bufferSize = 8192;
+
+    function audio_onprocess(e) {
+      var out = new Float32Array(bufferSize);
+      me.scriptStats.callbacks++;
+
+      if (me.scriptStats.prebuffering) {
+        if (me.audioBufferSamples < me.startQueueSamples) {
+          me.scriptStats.silenceSamples += bufferSize;
+          e.outputBuffer.copyToChannel(out, 0);
+          return;
+        }
+        me.scriptStats.prebuffering = false;
+      }
+
+      var total = 0;
+      while (me.audioBuffers.length && total < bufferSize) {
+        var b = me.audioBuffers[0];
+        var take = Math.min(b.length, bufferSize - total);
+        out.set(b.subarray(0, take), total);
+        total += take;
+        me.audioBufferSamples -= take;
+        if (take === b.length) me.audioBuffers.shift();
+        else me.audioBuffers[0] = b.subarray(take);
+      }
+
+      if (total < bufferSize) {
+        me.scriptStats.underruns++;
+        me.scriptStats.silenceSamples += (bufferSize - total);
+        me.scriptStats.prebuffering = true;
+      }
+      me.scriptStats.playedSamples += total;
+      me.scriptStats.queuedSamples = me.audioBufferSamples;
+      e.outputBuffer.copyToChannel(out, 0);
+      me.audioSamples.add(total);
+    }
+
+    var method = me.audioContext.createScriptProcessor ? 'createScriptProcessor' : 'createJavaScriptNode';
+    me.audioNode = me.audioContext[method](bufferSize, 0, 1);
+    me.audioNode.onaudioprocess = audio_onprocess;
+    me.audioNode.connect(me.gainNode);
+    runCallbacks('ScriptProcessorNode');
+  };
+
   if (useAudioWorklets && me.audioContext.audioWorklet) {
-    me.audioContext.audioWorklet.addModule('static/lib/AudioProcessor.js').then(function () {
+    me.audioContext.audioWorklet.addModule(AUDIO_LATENCY_PROFILE.workletModule).then(function () {
       me.audioNode = new AudioWorkletNode(me.audioContext, 'openwebrx-audio-processor', {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [1],
         processorOptions: {
-          maxBufferSize: me.maxBufferSize
+          targetQueueMs: me.latencyProfile.targetQueueMs,
+          startQueueMs: me.latencyProfile.startQueueMs,
+          hardMaxQueueMs: me.latencyProfile.hardMaxQueueMs
         }
       });
       me.audioNode.connect(me.gainNode);
       me.audioNode.port.addEventListener('message', function (m) {
-        var json = JSON.parse(m.data);
-        if (typeof (json.buffersize) !== 'undefined') {
+        var json = m.data;
+        if (typeof json === 'string') {
+          try { json = JSON.parse(json); } catch (_) { return; }
+        }
+        if (!json || typeof json !== 'object') return;
+        if (json.type === 'stats' || typeof json.queueSamples !== 'undefined' || typeof json.buffersize !== 'undefined') {
+          me.workletStats = json;
+          var queued = Number(json.queueSamples ?? json.buffersize ?? 0);
           me.audioReporter({
-            buffersize: json.buffersize
+            buffersize: queued,
+            queueMs: me.samplesToMs(queued),
+            underruns: Number(json.underruns || 0),
+            overruns: Number(json.overruns || 0),
+            droppedSamples: Number(json.droppedSamples || 0)
           });
         }
-        if (typeof (json.samplesProcessed) !== 'undefined') {
-          me.audioSamples.add(json.samplesProcessed);
+        if (typeof json.samplesProcessed !== 'undefined') {
+          me.audioSamples.add(Number(json.samplesProcessed) || 0);
         }
       });
       me.audioNode.port.start();
       runCallbacks('AudioWorklet');
+    }).catch(function (error) {
+      me.lastWorkletError = String(error && error.message ? error.message : error);
+      WebRxDiagnostics.markAudioWorkletLoadFailure();
+      startScriptProcessor(me.lastWorkletError);
     });
   } else {
-    me.audioBuffers = [];
-
-    if (!AudioBuffer.prototype.copyToChannel) { //Chrome 36 does not have it, Firefox does
-      AudioBuffer.prototype.copyToChannel = function (input, channel) //input is Float32Array
-      {
-        var cd = this.getChannelData(channel);
-        for (var i = 0; i < input.length; i++) cd[i] = input[i];
-      }
-    }
-
-    var bufferSize;
-    if (me.audioContext.sampleRate < 44100 * 2)
-      bufferSize = 4096;
-    else if (me.audioContext.sampleRate >= 44100 * 2 && me.audioContext.sampleRate < 44100 * 4)
-      bufferSize = 4096 * 2;
-    else if (me.audioContext.sampleRate > 44100 * 4)
-      bufferSize = 4096 * 4;
-
-
-    function audio_onprocess(e) {
-      var total = 0;
-      var out = new Float32Array(bufferSize);
-      while (me.audioBuffers.length) {
-        var b = me.audioBuffers.shift();
-        // not enough space to fit all data, so splice and put back in the queue
-        if (total + b.length > bufferSize) {
-          var spaceLeft = bufferSize - total;
-          var tokeep = b.subarray(0, spaceLeft);
-          out.set(tokeep, total);
-          var tobuffer = b.subarray(spaceLeft, b.length);
-          me.audioBuffers.unshift(tobuffer);
-          total += spaceLeft;
-          break;
-        } else {
-          out.set(b, total);
-          total += b.length;
-        }
-      }
-
-      e.outputBuffer.copyToChannel(out, 0);
-      me.audioSamples.add(total);
-
-    }
-
-    //on Chrome v36, createJavaScriptNode has been replaced by createScriptProcessor
-    var method = 'createScriptProcessor';
-    if (me.audioContext.createJavaScriptNode) {
-      method = 'createJavaScriptNode';
-    }
-    me.audioNode = me.audioContext[method](bufferSize, 0, 1);
-    me.audioNode.onaudioprocess = audio_onprocess;
-    me.audioNode.connect(me.gainNode);
-    runCallbacks('ScriptProcessorNode')
+    startScriptProcessor('AudioWorklet API not available (HTTP/non-secure context or browser capability)');
   }
 
-  setInterval(me.reportStats.bind(me), 1000);
+  if (!me.statsTimer) {
+    me.statsTimer = setInterval(me.reportStats.bind(me), me.latencyProfile.statsIntervalMs);
+  }
 };
 
 AudioEngine.prototype.onStart = function (callback) {
-  if (this.onStartCallbacks) {
-    this.onStartCallbacks.push(callback);
-  } else {
-    callback();
-  }
+  if (this.onStartCallbacks) this.onStartCallbacks.push(callback);
+  else callback(this.engineType);
 };
 
 AudioEngine.prototype.isAllowed = function () {
-  return this.audioContext.state === 'running';
+  return !!this.audioContext && this.audioContext.state === 'running';
 };
 
 AudioEngine.prototype.isStarted = function () {
   return this.started;
 };
 
+AudioEngine.prototype.samplesToMs = function (samples) {
+  if (!this.audioContext || !this.audioContext.sampleRate) return 0;
+  return Number(samples || 0) * 1000 / this.audioContext.sampleRate;
+};
+
 AudioEngine.prototype.reportStats = function () {
+  if (!this.audioNode) return;
   if (this.audioNode.port) {
-    this.audioNode.port.postMessage(JSON.stringify({ cmd: 'getStats' }));
+    this.audioNode.port.postMessage({ cmd: 'getStats' });
   } else {
+    this.scriptStats.queuedSamples = this.audioBufferSamples;
     this.audioReporter({
-      buffersize: this.getBuffersize()
+      buffersize: this.audioBufferSamples,
+      queueMs: this.samplesToMs(this.audioBufferSamples),
+      underruns: this.scriptStats.underruns,
+      overruns: this.scriptStats.overruns,
+      droppedSamples: this.scriptStats.droppedSamples
     });
   }
 };
@@ -1419,13 +4883,11 @@ AudioEngine.prototype.initStats = function () {
       var report = {};
       report[key] = v;
       me.audioReporter(report);
-    }
-
+    };
   };
 
   this.audioBytes = new Measurement();
   this.audioBytes.report(10000, 1000, buildReporter('audioByteRate'));
-
   this.audioSamples = new Measurement();
   this.audioSamples.report(10000, 1000, buildReporter('audioRate'));
 };
@@ -1435,7 +4897,7 @@ AudioEngine.prototype.resetStats = function () {
   this.audioSamples.reset();
 };
 
-AudioEngine.prototype.setupResampling = function () { //both at the server and the client
+AudioEngine.prototype.setupResampling = function () {
   var targetRate = this.audioContext.sampleRate;
   var audio_params = this.findRate(8000, 12000);
   if (!audio_params) {
@@ -1463,54 +4925,65 @@ AudioEngine.prototype.findRate = function (low, high) {
   var i = 1;
   while (true) {
     var audio_server_output_rate = Math.floor(targetRate / i);
-    if (audio_server_output_rate < low) {
-      return;
-    } else if (audio_server_output_rate >= low && audio_server_output_rate <= high) {
-      return {
-        resamplingFactor: i,
-        outputRate: audio_server_output_rate
-      }
+    if (audio_server_output_rate < low) return;
+    if (audio_server_output_rate <= high) {
+      return { resamplingFactor: i, outputRate: audio_server_output_rate };
     }
     i++;
-  };
-}
-
-AudioEngine.prototype.getOutputRate = function () {
-  return this.outputRate;
+  }
 };
 
-AudioEngine.prototype.getHdOutputRate = function () {
-  return this.hdOutputRate;
-}
+AudioEngine.prototype.getOutputRate = function () { return this.outputRate; };
+AudioEngine.prototype.getHdOutputRate = function () { return this.hdOutputRate; };
+AudioEngine.prototype.getSampleRate = function () { return this.audioContext.sampleRate; };
 
-AudioEngine.prototype.getSampleRate = function () {
-  return this.audioContext.sampleRate;
+AudioEngine.prototype.trimFallbackToTarget = function () {
+  var target = this.targetQueueSamples;
+  var toDrop = Math.max(0, this.audioBufferSamples - target);
+  var dropped = 0;
+  while (toDrop > 0 && this.audioBuffers.length) {
+    var first = this.audioBuffers[0];
+    var take = Math.min(toDrop, first.length);
+    dropped += take;
+    toDrop -= take;
+    this.audioBufferSamples -= take;
+    if (take === first.length) this.audioBuffers.shift();
+    else this.audioBuffers[0] = first.subarray(take);
+  }
+  if (dropped > 0) {
+    this.scriptStats.overruns++;
+    this.scriptStats.droppedSamples += dropped;
+  }
+};
+
+AudioEngine.prototype.enqueueFallback = function (buffer) {
+  if (!buffer || !buffer.length) return;
+  this.audioBuffers.push(buffer);
+  this.audioBufferSamples += buffer.length;
+  if (this.audioBufferSamples > this.hardMaxQueueSamples) {
+    this.trimFallbackToTarget();
+  }
+  this.scriptStats.queuedSamples = this.audioBufferSamples;
 };
 
 AudioEngine.prototype.processAudio = function (data, resampler, recorder) {
   if (!this.audioNode) return;
   this.audioBytes.add(data.byteLength);
   var buffer;
-  if (this.compression === "adpcm") {
-    //resampling & ADPCM
-    buffer = this.audioCodec.decodeWithSync(new Uint8Array(data));
-  } else {
-    buffer = new Int16Array(data);
-  }
-  if (this.recording) {
-    recorder.record(buffer);
-  }
+  if (this.compression === 'adpcm') buffer = this.audioCodec.decodeWithSync(new Uint8Array(data));
+  else buffer = new Int16Array(data);
+
+  if (this.recording) recorder.record(buffer);
   buffer = resampler.process(buffer);
+
   if (this.audioNode.port) {
-    // AudioWorklets supported
-    this.audioNode.port.postMessage(buffer);
+    // Transfer ownership to the audio render thread: no second PCM copy on the
+    // browser main thread. The worklet owns queue bounding/live-edge trimming.
+    this.audioNode.port.postMessage({ cmd: 'push', samples: buffer }, [buffer.buffer]);
   } else {
-    // silently drop excess samples
-    if (this.getBuffersize() + buffer.length <= this.maxBufferSize) {
-      this.audioBuffers.push(buffer);
-    }
+    this.enqueueFallback(buffer);
   }
-}
+};
 
 AudioEngine.prototype.pushAudio = function (data) {
   this.processAudio(data, this.resampler, this.recorder);
@@ -1520,20 +4993,98 @@ AudioEngine.prototype.pushAudio = function (data) {
 AudioEngine.prototype.pushHdAudio = function (data) {
   this.processAudio(data, this.hdResampler, this.hdRecorder);
   this.lastHd = true;
-}
+};
 
 AudioEngine.prototype.setCompression = function (compression) {
   this.compression = compression;
 };
 
 AudioEngine.prototype.setVolume = function (volume) {
-  this.gainNode.gain.value = volume;
+  var v = Number(volume);
+  if (!Number.isFinite(v)) return;
+  this.volume = Math.max(0, v);
+  if (this.gainNode) this.gainNode.gain.value = this.volume;
+};
+
+AudioEngine.prototype.configureLatencyProfile = function (options) {
+  options = options || {};
+  function clampNumber(value, fallback, min, max) {
+    var n = Number(value);
+    if (!Number.isFinite(n)) n = fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  var target = clampNumber(options.targetQueueMs, this.latencyProfile.targetQueueMs, 10, 200);
+  var start = clampNumber(options.startQueueMs, this.latencyProfile.startQueueMs, 10, 200);
+  var hardMin = Math.max(target, start) + 20;
+  var hard = clampNumber(options.hardMaxQueueMs, this.latencyProfile.hardMaxQueueMs, hardMin, 500);
+
+  this.latencyProfile.targetQueueMs = target;
+  this.latencyProfile.startQueueMs = start;
+  this.latencyProfile.hardMaxQueueMs = Math.max(hardMin, hard);
+  this.targetQueueSamples = this.msToSamples(target);
+  this.startQueueSamples = this.msToSamples(start);
+  this.hardMaxQueueSamples = this.msToSamples(this.latencyProfile.hardMaxQueueMs);
+  this.maxBufferSize = this.hardMaxQueueSamples;
+
+  if (this.audioNode && this.audioNode.port) {
+    this.audioNode.port.postMessage({
+      cmd: 'configure',
+      targetQueueMs: target,
+      startQueueMs: start,
+      hardMaxQueueMs: this.latencyProfile.hardMaxQueueMs
+    });
+  } else if (this.audioBufferSamples > this.hardMaxQueueSamples) {
+    this.trimFallbackToTarget();
+  }
+
+  return this.getLatencySnapshot();
 };
 
 AudioEngine.prototype.getBuffersize = function () {
-  // only available when using ScriptProcessorNode
-  if (!this.audioBuffers) return 0;
-  return this.audioBuffers.map(function (b) { return b.length; }).reduce(function (a, b) { return a + b; }, 0);
+  if (this.audioNode && this.audioNode.port && this.workletStats) {
+    return Number(this.workletStats.queueSamples || this.workletStats.buffersize || 0);
+  }
+  return this.audioBufferSamples || 0;
+};
+
+AudioEngine.prototype.getLatencySnapshot = function () {
+  var stats = (this.audioNode && this.audioNode.port) ? (this.workletStats || {}) : this.scriptStats;
+  var queueSamples = Number(stats.queueSamples ?? stats.buffersize ?? this.audioBufferSamples ?? 0);
+  return {
+    engine: this.engineType,
+    contextState: this.audioContext ? this.audioContext.state : 'unavailable',
+    secureContext: !!window.isSecureContext,
+    sampleRate: this.audioContext ? this.audioContext.sampleRate : 0,
+    baseLatencyMs: this.audioContext && Number.isFinite(this.audioContext.baseLatency)
+      ? Number((this.audioContext.baseLatency * 1000).toFixed(2)) : null,
+    outputLatencyMs: this.audioContext && Number.isFinite(this.audioContext.outputLatency)
+      ? Number((this.audioContext.outputLatency * 1000).toFixed(2)) : null,
+    queueSamples: queueSamples,
+    queueMs: Number(this.samplesToMs(queueSamples).toFixed(2)),
+    targetQueueMs: this.latencyProfile.targetQueueMs,
+    startQueueMs: this.latencyProfile.startQueueMs,
+    hardMaxQueueMs: this.latencyProfile.hardMaxQueueMs,
+    prebuffering: !!stats.prebuffering,
+    underruns: Number(stats.underruns || 0),
+    overruns: Number(stats.overruns || 0),
+    droppedSamples: Number(stats.droppedSamples || 0),
+    droppedMs: Number(this.samplesToMs(Number(stats.droppedSamples || 0)).toFixed(2)),
+    playedSamples: Number(stats.playedSamples || stats.samplesProcessed || 0),
+    silenceSamples: Number(stats.silenceSamples || 0),
+    callbacks: Number(stats.callbacks || 0),
+    compression: this.compression,
+    lastWorkletError: this.lastWorkletError
+  };
+};
+window.getAudioLatencySnapshot = function () {
+  return audioEngine && typeof audioEngine.getLatencySnapshot === 'function'
+    ? audioEngine.getLatencySnapshot()
+    : null;
+};
+window.configureAudioLatency = function (options) {
+  if (!audioEngine || typeof audioEngine.configureLatencyProfile !== 'function') return null;
+  return audioEngine.configureLatencyProfile(options);
 };
 
 AudioEngine.prototype.startRecording = function () {
@@ -2601,86 +6152,152 @@ function sendCutFrequencies() {
 }
 
 function zoomCanvasIn() {
+  const centerHz = FrequencyViewTransform.getViewSnapshot().viewCenterHz;
   zoomLevel = Math.min(zoomLevel + zoomStep, zoomMax);
-  updateCanvasZoom();
+  updateCanvasZoom({ reason: "zoom-in", centerHz });
 }
 
 // === ฟังก์ชันซูมออก ===
 function zoomCanvasOut() {
+  const centerHz = FrequencyViewTransform.getViewSnapshot().viewCenterHz;
   const minZoom = Math.max(zoomMin, zoomDefault);  // ป้องกันต่ำกว่า default
   zoomLevel = Math.max(zoomLevel - zoomStep, minZoom);
-  updateCanvasZoom();
+  updateCanvasZoom({ reason: "zoom-out", centerHz });
 }
 
-// === ฟังก์ชันซูมออก ===
 function clearMax() {
-  maxHoldData = []
+  maxHoldData = [];
+  scheduleSpectrumFrame();
 }
 
 function zoomCanvasReset() {
   zoomLevel = 1;
-  updateCanvasZoom();
+  updateCanvasZoom({ reason: "zoom-reset", centerHz: ReceiverState.centerHz });
 }
-// function updateCanvasZoom() {
-//   const spectrumCanvas = document.getElementById('spectrum-plot');
-//   const waterfallCanvas = document.getElementById('waterfall');
-//   const waterfallScaleCanvas = document.getElementById('waterfall-scale');
 
-//   // Update width style only (not height)
-//   spectrumCanvas.style.width = (100 * zoomLevel) + "%";
-//   waterfallCanvas.style.width = (100 * zoomLevel) + "%";
-//   waterfallScaleCanvas.style.width = (100 * zoomLevel) + "%";
+// Programmatic View Span API. It changes browser presentation only; no
+// setfrequency/offset_freq command is emitted. The existing +/-/Reset buttons
+// remain the visible UI, so the page theme/layout is unchanged.
+function setViewSpanHz(viewSpanHz) {
+  const acquisitionSpanHz = Math.max(1, ReceiverState.sampleRateHz);
+  const requested = Number(viewSpanHz);
+  if (!Number.isFinite(requested) || requested <= 0) return false;
+  const before = FrequencyViewTransform.getViewSnapshot();
+  const requestedZoom = acquisitionSpanHz / Math.min(acquisitionSpanHz, requested);
+  zoomLevel = Math.max(zoomDefault, Math.min(zoomMax, requestedZoom));
+  updateCanvasZoom({ reason: "view-span", centerHz: before.viewCenterHz });
+  return true;
+}
+window.setViewSpanHz = setViewSpanHz;
+window.getViewSpan = () => FrequencyViewTransform.getViewSnapshot();
 
-//   // Optional: adjust actual .width to match style for scaling fidelity
-//   spectrumCanvas.width = spectrumCanvas.offsetWidth;
-//   waterfallCanvas.width = waterfallCanvas.offsetWidth;
-//   waterfallScaleCanvas.width = waterfallScaleCanvas.offsetWidth;
+function ensureSpectrumVirtualSizer(container) {
+  if (!container) return null;
+  let sizer = document.getElementById("webrx-spectrum-virtual-sizer");
+  if (!sizer) {
+    sizer = document.createElement("div");
+    sizer.id = "webrx-spectrum-virtual-sizer";
+    sizer.setAttribute("aria-hidden", "true");
+    sizer.style.height = "0px";
+    sizer.style.minHeight = "0px";
+    sizer.style.padding = "0";
+    sizer.style.margin = "0";
+    sizer.style.border = "0";
+    sizer.style.visibility = "hidden";
+    sizer.style.pointerEvents = "none";
+    sizer.style.userSelect = "none";
+    container.appendChild(sizer);
+  }
+  return sizer;
+}
 
+function configureViewportCanvas(canvas, viewportWidth) {
+  if (!canvas) return;
+  // The backing/CSS width is always the visible viewport width. Zoom is
+  // represented by the virtual scroll range, never by a giant Canvas.
+  canvas.style.width = `${viewportWidth}px`;
+  canvas.style.maxWidth = "none";
+  canvas.style.position = "sticky";
+  canvas.style.left = "0px";
+  canvas.style.zIndex = "1";
+}
 
-//   if (latestFFT) {
-//     drawScale();
-//     drawSpectrum(Array.from(latestFFT));
-//     drawWaterfallLine(Array.from(latestFFT));
-//   }
-// }
+let viewportRefreshPending = false;
+let viewportRefreshReason = "";
+function scheduleViewportRefresh(reason = "view") {
+  viewportRefreshReason = reason;
+  if (viewportRefreshPending) return;
+  viewportRefreshPending = true;
+  requestAnimationFrame(() => {
+    viewportRefreshPending = false;
+    const refreshReason = viewportRefreshReason || "view";
+    viewportRefreshReason = "";
+    invalidateSpectrumStaticLayer();
+    drawScale();
+    scheduleSpectrumFrame();
+    if (typeof WaterfallEngine !== "undefined" &&
+        typeof WaterfallEngine.invalidateProjection === "function") {
+      WaterfallEngine.invalidateProjection(refreshReason);
+    }
+    positionZoomBar();
+  });
+}
 
-
-function updateCanvasZoom() {
+// True viewport renderer: Canvas dimensions remain equal to the visible
+// viewport at every zoom level. A zero-height virtual sizer keeps the existing
+// native horizontal scrollbar/pan UX while rendering only the visible RF span.
+function updateCanvasZoom(options = {}) {
   const spectrumCanvas = document.getElementById('spectrum-plot');
   const waterfallCanvas = document.getElementById('waterfall');
   const waterfallScaleCanvas = document.getElementById('waterfall-scale');
   const sc = document.getElementById('spectrum-container');
+  if (!spectrumCanvas || !waterfallCanvas || !waterfallScaleCanvas || !sc) return false;
 
-  // บันทึกกึ่งกลาง viewport เดิม (ไว้รักษาตำแหน่งหลังซูม)
-  const oldContentWidth = spectrumCanvas.offsetWidth || spectrumCanvas.width || 1;
-  const centerBefore = sc.scrollLeft + sc.clientWidth / 2;
-  const centerRatio = centerBefore / oldContentWidth;
+  const before = FrequencyViewTransform.getViewSnapshot();
+  const desiredCenterHz = Number.isFinite(Number(options.centerHz))
+    ? Number(options.centerHz)
+    : before.viewCenterHz;
 
-  // อัปเดต style width เฉพาะแนวนอน (ไม่ยุ่งกับความสูง)
-  spectrumCanvas.style.width = (100 * zoomLevel) + "%";
-  waterfallCanvas.style.width = (100 * zoomLevel) + "%";
-  waterfallScaleCanvas.style.width = (100 * zoomLevel) + "%";
+  const viewportWidth = Math.max(1, Math.round(sc.clientWidth || spectrumCanvas.clientWidth || 1));
+  const virtualWidth = Math.max(viewportWidth, Math.round(viewportWidth * Math.max(1, zoomLevel)));
+  const sizer = ensureSpectrumVirtualSizer(sc);
 
-  // sync ค่า .width ตามขนาดจริงเพื่อความคมชัดของเส้นกราฟ
-  spectrumCanvas.width = spectrumCanvas.offsetWidth;
-  waterfallCanvas.width = waterfallCanvas.offsetWidth;
-  waterfallScaleCanvas.width = waterfallScaleCanvas.offsetWidth;
+  configureViewportCanvas(waterfallScaleCanvas, viewportWidth);
+  configureViewportCanvas(spectrumCanvas, viewportWidth);
+  configureViewportCanvas(waterfallCanvas, viewportWidth);
+  if (sizer) sizer.style.width = `${virtualWidth}px`;
 
-  // รักษากึ่งกลางมุมมองไว้ (scroll ให้กลับไปตำแหน่งเดิมเชิงสัดส่วน)
-  const newContentWidth = spectrumCanvas.offsetWidth || spectrumCanvas.width;
-  const newCenter = centerRatio * newContentWidth;
-  sc.scrollLeft = Math.max(0, newCenter - sc.clientWidth / 2);
-
-  // วาดใหม่ถ้ามี FFT ล่าสุด
-  if (latestFFT) {
-    drawScale();
-    positionZoomBar(); // เผื่อชัวร์อีกที
-    const data = getLatestFFTData();
-    drawSpectrum(data);
-    drawWaterfallLine(data);
+  // Keep backing stores viewport-sized for crisp rendering without allocating
+  // a 2x..5x bitmap. WaterfallEngine owns the waterfall backing store.
+  if (spectrumCanvas.width !== viewportWidth) {
+    spectrumCanvas.width = viewportWidth;
+    invalidateSpectrumStaticLayer();
   }
+  if (waterfallScaleCanvas.width !== viewportWidth) {
+    waterfallScaleCanvas.width = viewportWidth;
+  }
+  if (typeof WaterfallEngine !== "undefined") {
+    WaterfallEngine.onViewGeometryChanged();
+  }
+
+  // Reading scrollWidth commits the virtual geometry before restoring center.
+  void sc.scrollWidth;
+  FrequencyViewTransform.scrollToCenterHz(desiredCenterHz);
+  scheduleViewportRefresh(options.reason || "zoom");
+  return true;
 }
 
+function setViewCenterHz(centerHz) {
+  if (!Number.isFinite(Number(centerHz))) return false;
+  const ok = FrequencyViewTransform.scrollToCenterHz(Number(centerHz));
+  if (ok) scheduleViewportRefresh("view-center");
+  return ok;
+}
+window.setViewCenterHz = setViewCenterHz;
+window.panViewByHz = function(deltaHz) {
+  const view = FrequencyViewTransform.getViewSnapshot();
+  return setViewCenterHz(view.viewCenterHz + Number(deltaHz || 0));
+};
 
 // วางปุ่มชิดขวาบนของ #spectrum-container แบบ overlay (fixed)
 function positionZoomBar() {
@@ -2697,22 +6314,23 @@ function positionZoomBar() {
   bar.style.top = y + 'px';
 }
 
-// จัดตำแหน่งซ้ำเมื่อมีเหตุให้ layout เปลี่ยน
 window.addEventListener('resize', positionZoomBar, { passive: true });
+window.addEventListener('resize', () => {
+  updateCanvasZoom({ reason: "resize" });
+}, { passive: true });
 window.addEventListener('scroll', positionZoomBar, { passive: true });
 
-// เรียกหลังซูม/สลับ waterfall/ max hold เสมอ
-// ...ใน updateCanvasZoom() ท้ายฟังก์ชันมีเรียกอยู่แล้ว...
-// ถ้ายังไม่ได้ ให้เพิ่ม:
 requestAnimationFrame(positionZoomBar);
 
-
-// อัปเดตตำแหน่งเมื่อเลื่อนในกราฟ และเมื่อหน้าต่างเปลี่ยนขนาด
-window.addEventListener('resize', positionZoomBar);
 document.addEventListener('DOMContentLoaded', () => {
   const sc = document.getElementById('spectrum-container');
-  if (sc) sc.addEventListener('scroll', positionZoomBar, { passive: true });
-  // เรียกครั้งแรกเผื่อ DOM พร้อมแล้ว
+  if (sc) {
+    sc.addEventListener('scroll', () => {
+      positionZoomBar();
+      scheduleViewportRefresh("pan");
+    }, { passive: true });
+  }
+  updateCanvasZoom({ reason: "dom-ready" });
   positionZoomBar();
 });
 
@@ -2729,10 +6347,15 @@ function toggleWaterfall(force) {
 
   if (wf) {
     if (waterfallEnabled) {
-      // แสดง + เคลียร์หน้าให้สะอาดก่อนเริ่มวาดรอบถัดไป
+      // แสดง + เริ่ม history ใหม่เหมือน behavior เดิม แต่ให้ engine เป็น owner
+      // ของทั้ง canvas pixels และ ring-buffer state.
       wf.style.display = '';
-      const ctx = wf.getContext('2d');
-      ctx.clearRect(0, 0, wf.width, wf.height);
+      if (typeof WaterfallEngine !== "undefined") {
+        WaterfallEngine.clear();
+      } else {
+        const ctx = wf.getContext('2d');
+        ctx.clearRect(0, 0, wf.width, wf.height);
+      }
     } else {
       // ซ่อนเพื่อไม่ให้กินพื้นที่ และหยุดวาด
       wf.style.display = 'none';
@@ -4457,11 +8080,8 @@ function setupPresetCardClick(card) {
           mod: (preset.mod || "").toLowerCase(),
           low_cut: typeof preset.low_cut === "number" ? preset.low_cut : (window.currentLowCut ?? 0),
           high_cut: typeof preset.high_cut === "number" ? preset.high_cut : (window.currentHighCut ?? 0),
-          offset_freq: Math.round(
-            typeof preset.offset_freq === "number"
-              ? preset.offset_freq
-              : (window.offsetFrequency || 0)
-          ),
+          // Phase G ownership rule: modulation/BW/SQL commands must not tune.
+          // Frequency is applied separately through FrequencyController below.
           squelch_level:
             typeof preset.squelch_level === "number"
               ? preset.squelch_level
@@ -4643,9 +8263,7 @@ function extractEnabledSdrProfiles(settings) {
     for (const profileId in sdr.profiles) {
       const p = sdr.profiles[profileId];
 
-      center_freq = p.center_freq ?? null; // in Hz, update via config
-      bandwidth = p.samp_rate ?? null;    // in Hz, update via config
-
+      // Reading settings profiles must not mutate the live receiver state.
       result.push({
         sdr_id: sdrId,
         sdr_name: sdrName,

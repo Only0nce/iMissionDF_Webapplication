@@ -292,7 +292,7 @@ if (!empty($rolesList) && $roleID == -1) {
                 </li> -->
                 <li class="nav-item">
                   <a class="nav-link d-flex align-items-center gap-2"
-                     href="audiofiles">
+                     href="showaudio.php">
                     <svg class="bi">
                       <use xlink:href="fontawesome-free-5.15.4-web/sprites/regular.svg?v=<?php echo time();?>#file-audio"/>
                     </svg>
