@@ -1,0 +1,806 @@
+/* Shared light/dark theme toggle for all RCMS/AstraRX pages. */
+.app-theme-host {
+  position: relative;
+  padding-right: 3.4rem !important;
+}
+
+.app-theme-toggle {
+  width: 2.35rem;
+  height: 2.35rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 50%;
+  background: rgba(20,24,28,.84);
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,.2);
+  transition: transform .15s ease, background-color .15s ease, border-color .15s ease;
+  z-index: 1080;
+}
+
+.app-theme-host > .app-theme-toggle {
+  position: absolute;
+  right: .65rem;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.app-theme-toggle--floating {
+  position: fixed;
+  top: .75rem;
+  right: .75rem;
+}
+
+.app-theme-toggle:hover {
+  background: rgba(50,56,63,.96);
+  border-color: rgba(255,255,255,.45);
+}
+
+.app-theme-host > .app-theme-toggle:hover {
+  transform: translateY(-50%) scale(1.05);
+}
+
+.app-theme-toggle--floating:hover {
+  transform: scale(1.05);
+}
+
+.app-theme-toggle:focus-visible {
+  outline: 3px solid rgba(13,110,253,.4);
+  outline-offset: 2px;
+}
+
+.app-theme-toggle svg {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: currentColor;
+  pointer-events: none;
+}
+
+html[data-bs-theme="light"] body {
+  color-scheme: light;
+}
+
+html[data-bs-theme="dark"] body {
+  color-scheme: dark;
+}
+
+@media (max-width: 575.98px) {
+  .app-theme-host {
+    padding-right: 3rem !important;
+  }
+
+  .app-theme-toggle {
+    width: 2.15rem;
+    height: 2.15rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-theme-toggle { transition: none; }
+}
+
+/* ========================================================================
+ * T4 - Shared visual theme compatibility layer
+ * Keeps legacy page layout/behavior intact while normalizing Bootstrap and
+ * older hard-coded surfaces to the selected light/dark theme.
+ * ======================================================================== */
+:root[data-bs-theme="light"] {
+  --app-page-bg: #f6f8fb;
+  --app-surface: #ffffff;
+  --app-surface-2: #f3f6f9;
+  --app-surface-3: #e9eef4;
+  --app-text: #1f2937;
+  --app-text-muted: #667085;
+  --app-border: #d8e0e8;
+  --app-border-strong: #bcc8d4;
+  --app-header-bg: rgba(255, 255, 255, .96);
+  --app-header-text: #17212b;
+  --app-input-bg: #ffffff;
+  --app-input-text: #1f2937;
+  --app-input-placeholder: #7a8795;
+  --app-hover-bg: #eef4f9;
+  --app-shadow: 0 4px 16px rgba(15, 23, 42, .10);
+  --app-shadow-strong: 0 10px 30px rgba(15, 23, 42, .15);
+  --app-accent: #0d6efd;
+  --app-focus: rgba(13, 110, 253, .20);
+  --app-theme-button-bg: rgba(255, 255, 255, .94);
+  --app-theme-button-text: #17212b;
+  --app-theme-button-border: rgba(31, 41, 55, .20);
+  --app-theme-button-hover: #edf2f7;
+  --app-canvas-bg: #fefefe;
+  --app-canvas-border: #cfd7df;
+  --app-meter-bg: #e4eaf0;
+}
+
+:root[data-bs-theme="dark"] {
+  --app-page-bg: #11161b;
+  --app-surface: #1b2229;
+  --app-surface-2: #222b33;
+  --app-surface-3: #2b3640;
+  --app-text: #e7edf3;
+  --app-text-muted: #a8b4bf;
+  --app-border: #3b4650;
+  --app-border-strong: #52616d;
+  --app-header-bg: rgba(13, 17, 22, .96);
+  --app-header-text: #f5f7fa;
+  --app-input-bg: #222b33;
+  --app-input-text: #edf2f7;
+  --app-input-placeholder: #8d99a5;
+  --app-hover-bg: #28333d;
+  --app-shadow: 0 4px 16px rgba(0, 0, 0, .30);
+  --app-shadow-strong: 0 10px 30px rgba(0, 0, 0, .45);
+  --app-accent: #4b9cff;
+  --app-focus: rgba(75, 156, 255, .22);
+  --app-theme-button-bg: rgba(27, 34, 41, .94);
+  --app-theme-button-text: #f8fafc;
+  --app-theme-button-border: rgba(255, 255, 255, .20);
+  --app-theme-button-hover: #2a343d;
+  --app-canvas-bg: #11161b;
+  --app-canvas-border: #3b4650;
+  --app-meter-bg: #222b33;
+}
+
+/* Shared page shell */
+html[data-bs-theme] body {
+  background-color: var(--app-page-bg);
+  color: var(--app-text);
+}
+
+html[data-bs-theme] header.navbar {
+  background-color: var(--app-header-bg) !important;
+  color: var(--app-header-text);
+  border-bottom: 1px solid var(--app-border);
+  backdrop-filter: blur(10px);
+}
+
+html[data-bs-theme="light"] header.navbar .nav-link,
+html[data-bs-theme="light"] header.navbar .navbar-brand,
+html[data-bs-theme="light"] header.navbar .text-white {
+  color: var(--app-header-text) !important;
+}
+
+html[data-bs-theme] .sidebar,
+html[data-bs-theme] .offcanvas,
+html[data-bs-theme] .card,
+html[data-bs-theme] .modal-content,
+html[data-bs-theme] .dropdown-menu,
+html[data-bs-theme] .list-group-item {
+  border-color: var(--app-border);
+}
+
+html[data-bs-theme] .modal-content,
+html[data-bs-theme] .dropdown-menu {
+  background-color: var(--app-surface);
+  color: var(--app-text);
+}
+
+html[data-bs-theme] .modal-header,
+html[data-bs-theme] .modal-footer {
+  border-color: var(--app-border);
+}
+
+/* Forms */
+html[data-bs-theme] .form-control,
+html[data-bs-theme] .form-select,
+html[data-bs-theme] textarea,
+html[data-bs-theme] input[type="text"],
+html[data-bs-theme] input[type="number"],
+html[data-bs-theme] input[type="search"],
+html[data-bs-theme] input[type="password"],
+html[data-bs-theme] input[type="email"] {
+  background-color: var(--app-input-bg);
+  color: var(--app-input-text);
+  border-color: var(--app-border);
+}
+
+html[data-bs-theme] .form-control::placeholder,
+html[data-bs-theme] textarea::placeholder,
+html[data-bs-theme] input::placeholder {
+  color: var(--app-input-placeholder);
+  opacity: 1;
+}
+
+html[data-bs-theme] .form-control:focus,
+html[data-bs-theme] .form-select:focus,
+html[data-bs-theme] textarea:focus,
+html[data-bs-theme] input:focus {
+  background-color: var(--app-input-bg);
+  color: var(--app-input-text);
+  border-color: var(--app-accent);
+  box-shadow: 0 0 0 .2rem var(--app-focus);
+}
+
+html[data-bs-theme] .form-text,
+html[data-bs-theme] .text-muted {
+  color: var(--app-text-muted) !important;
+}
+
+/* Tables */
+html[data-bs-theme] .table {
+  --bs-table-color: var(--app-text);
+  --bs-table-bg: var(--app-surface);
+  --bs-table-border-color: var(--app-border);
+  --bs-table-striped-bg: var(--app-surface-2);
+  --bs-table-striped-color: var(--app-text);
+  --bs-table-hover-bg: var(--app-hover-bg);
+  --bs-table-hover-color: var(--app-text);
+  color: var(--app-text);
+  border-color: var(--app-border);
+}
+
+html[data-bs-theme] table th,
+html[data-bs-theme] table td {
+  border-color: var(--app-border);
+}
+
+/* Theme toggle itself now belongs to the selected theme. */
+.app-theme-toggle {
+  background: var(--app-theme-button-bg);
+  color: var(--app-theme-button-text);
+  border-color: var(--app-theme-button-border);
+  box-shadow: var(--app-shadow);
+}
+
+.app-theme-toggle:hover {
+  background: var(--app-theme-button-hover);
+  border-color: var(--app-border-strong);
+}
+
+/* Legacy controller page */
+html[data-bs-theme] .device-form {
+  background: var(--app-surface) !important;
+  color: var(--app-text);
+  border: 1px solid var(--app-border);
+  box-shadow: var(--app-shadow);
+}
+
+html[data-bs-theme] .device-form label {
+  color: var(--app-text) !important;
+}
+
+html[data-bs-theme] .device-form input[type="text"],
+html[data-bs-theme] .device-form select,
+html[data-bs-theme] .device-form textarea,
+html[data-bs-theme] #editDeviceModal .form-control,
+html[data-bs-theme] #addDeviceModal .form-control {
+  background: var(--app-input-bg) !important;
+  color: var(--app-input-text) !important;
+  border-color: var(--app-border) !important;
+  box-shadow: none !important;
+}
+
+html[data-bs-theme] .device-form input[type="text"]:focus,
+html[data-bs-theme] .device-form select:focus,
+html[data-bs-theme] .device-form textarea:focus,
+html[data-bs-theme] #editDeviceModal .form-control:focus,
+html[data-bs-theme] #addDeviceModal .form-control:focus {
+  background: var(--app-input-bg) !important;
+  color: var(--app-input-text) !important;
+  border-color: var(--app-accent) !important;
+  box-shadow: 0 0 0 .2rem var(--app-focus) !important;
+}
+
+html[data-bs-theme] #deviceTable {
+  background: var(--app-surface) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] #deviceTable thead th {
+  color: var(--app-text) !important;
+  background: var(--app-surface-2) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] #deviceTable tbody td,
+html[data-bs-theme] #deviceTable tbody tr:nth-child(even) td {
+  color: var(--app-text) !important;
+  background: var(--app-surface) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] #deviceTable tbody tr:nth-child(even) td {
+  background: var(--app-surface-2) !important;
+}
+
+html[data-bs-theme] #deviceTable tbody tr:hover td,
+html[data-bs-theme] #deviceTable tbody tr:nth-child(even):hover td {
+  background: var(--app-hover-bg) !important;
+}
+
+/* AstraRX main UI: remove remaining dark-only inline styling. */
+html[data-bs-theme] #scanRF .scan-header-box,
+html[data-bs-theme] #memoryRF .scan-header-box {
+  color: var(--app-text);
+}
+
+html[data-bs-theme] #scanRF .scan-header-box [style*="color:#ccc"],
+html[data-bs-theme] #memoryRF .scan-header-box [style*="color:#ccc"] {
+  color: var(--app-text-muted) !important;
+}
+
+html[data-bs-theme] #scanFilterDate,
+html[data-bs-theme] #scanFilterHour {
+  background: var(--app-input-bg) !important;
+  color: var(--app-input-text) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] #addPresetModal .modal-content {
+  background-color: var(--app-surface) !important;
+  color: var(--app-text) !important;
+}
+
+html[data-bs-theme] #addPresetModal .form-text {
+  color: var(--app-text-muted) !important;
+}
+
+/* Map visual connection badge readability. */
+html[data-bs-theme="light"] .conn-glass {
+  color: #334155 !important;
+}
+
+html[data-bs-theme="dark"] .conn-glass {
+  color: #e5e7eb !important;
+}
+
+/* Standalone WebRX canvas page */
+html[data-bs-theme] canvas {
+  border-color: var(--app-canvas-border);
+}
+
+html[data-bs-theme] #smeter-bar {
+  background: var(--app-meter-bg) !important;
+  border-color: var(--app-border-strong) !important;
+}
+
+/* Audio/archive page compatibility. Keep semantic signal colors unchanged. */
+html[data-bs-theme] .audio-card,
+html[data-bs-theme] .audio-player-card,
+html[data-bs-theme] .archive-card,
+html[data-bs-theme] .filter-panel {
+  background: var(--app-surface) !important;
+  color: var(--app-text) !important;
+  border-color: var(--app-border) !important;
+}
+
+@media (max-width: 575.98px) {
+  html[data-bs-theme] header.navbar.app-theme-host {
+    min-height: 3rem;
+  }
+}
+
+/* Build marker: THEME-T4-CSS-AUDIT-20260930 */
+
+/* ========================================================================
+ * T5 - Page-specific visual polish / regression hardening
+ * Scope: AstraRX main page, Controller, Audio Archive, Map Visual.
+ * Pure presentation overrides: no RF/DSP/network/business logic changes.
+ * ======================================================================== */
+
+/* ---------- Cross-page interaction states ---------- */
+html[data-bs-theme] * {
+  scrollbar-color: var(--app-border-strong) var(--app-surface-2);
+}
+
+html[data-bs-theme] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+html[data-bs-theme] ::-webkit-scrollbar-track {
+  background: var(--app-surface-2);
+}
+
+html[data-bs-theme] ::-webkit-scrollbar-thumb {
+  background: var(--app-border-strong);
+  border: 2px solid var(--app-surface-2);
+  border-radius: 999px;
+}
+
+html[data-bs-theme] ::-webkit-scrollbar-thumb:hover {
+  background: var(--app-text-muted);
+}
+
+html[data-bs-theme] .btn-close {
+  filter: none;
+}
+
+html[data-bs-theme="dark"] .btn-close {
+  filter: invert(1) grayscale(100%) brightness(180%);
+}
+
+html[data-bs-theme] .modal-backdrop.show,
+html[data-bs-theme] .offcanvas-backdrop.show {
+  opacity: .58;
+}
+
+html[data-bs-theme="light"] .modal-backdrop.show,
+html[data-bs-theme="light"] .offcanvas-backdrop.show {
+  opacity: .38;
+}
+
+html[data-bs-theme] .nav-link:focus-visible,
+html[data-bs-theme] .btn:focus-visible,
+html[data-bs-theme] a:focus-visible {
+  outline: 3px solid var(--app-focus);
+  outline-offset: 2px;
+}
+
+/* ---------- AstraRX main page / presets ---------- */
+html[data-bs-theme] #add-preset-card,
+html[data-bs-theme] .preset-card,
+html[data-bs-theme] .memory-card,
+html[data-bs-theme] .scan-card {
+  background: var(--app-surface) !important;
+  color: var(--app-text) !important;
+  border-color: var(--app-border) !important;
+  box-shadow: var(--app-shadow) !important;
+}
+
+html[data-bs-theme] #add-preset-card:hover,
+html[data-bs-theme] .preset-card:hover,
+html[data-bs-theme] .memory-card:hover,
+html[data-bs-theme] .scan-card:hover {
+  background: var(--app-hover-bg) !important;
+  border-color: var(--app-accent) !important;
+  box-shadow: var(--app-shadow-strong) !important;
+}
+
+html[data-bs-theme] #add-preset-card .add-title,
+html[data-bs-theme] .preset-card .preset-title,
+html[data-bs-theme] .memory-card .title,
+html[data-bs-theme] .scan-card .title {
+  color: var(--app-text) !important;
+}
+
+html[data-bs-theme] #add-preset-card .add-sub,
+html[data-bs-theme] .preset-card .preset-subtitle,
+html[data-bs-theme] .memory-card .subtitle,
+html[data-bs-theme] .scan-card .subtitle {
+  color: var(--app-text-muted) !important;
+}
+
+html[data-bs-theme] #scanRF,
+html[data-bs-theme] #memoryRF {
+  color: var(--app-text);
+}
+
+html[data-bs-theme] #scanRF .scan-header-box,
+html[data-bs-theme] #memoryRF .scan-header-box {
+  background: var(--app-surface-2) !important;
+  border-color: var(--app-border) !important;
+  box-shadow: var(--app-shadow);
+}
+
+html[data-bs-theme] #scanRF .scan-header-box:hover,
+html[data-bs-theme] #memoryRF .scan-header-box:hover {
+  background: var(--app-hover-bg) !important;
+}
+
+/* ---------- Controller page ---------- */
+html[data-bs-theme] #addDeviceModal .modal-content,
+html[data-bs-theme] #editDeviceModal .modal-content,
+html[data-bs-theme] .device-modal,
+html[data-bs-theme] .device-detail-card {
+  background: var(--app-surface) !important;
+  color: var(--app-text) !important;
+  border-color: var(--app-border) !important;
+  box-shadow: var(--app-shadow-strong) !important;
+}
+
+html[data-bs-theme] #addDeviceModal .modal-header,
+html[data-bs-theme] #editDeviceModal .modal-header,
+html[data-bs-theme] #addDeviceModal .modal-footer,
+html[data-bs-theme] #editDeviceModal .modal-footer {
+  background: var(--app-surface-2) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] #addDeviceModal label,
+html[data-bs-theme] #editDeviceModal label,
+html[data-bs-theme] .device-detail-card,
+html[data-bs-theme] .device-detail-card * {
+  color: var(--app-text);
+}
+
+html[data-bs-theme] #deviceTable select,
+html[data-bs-theme] #deviceTable input,
+html[data-bs-theme] #deviceTable textarea {
+  background: var(--app-input-bg) !important;
+  color: var(--app-input-text) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] #deviceTable select:focus,
+html[data-bs-theme] #deviceTable input:focus,
+html[data-bs-theme] #deviceTable textarea:focus {
+  border-color: var(--app-accent) !important;
+  box-shadow: 0 0 0 .2rem var(--app-focus) !important;
+}
+
+/* Keep group separators semantic but make them visible in both themes. */
+html[data-bs-theme="dark"] #deviceTable .group-device { border-left-color: #4b9cff !important; }
+html[data-bs-theme="dark"] #deviceTable .group-network { border-left-color: #31c6d4 !important; }
+html[data-bs-theme="dark"] #deviceTable .group-meta { border-left-color: #8f9aa6 !important; }
+html[data-bs-theme="dark"] #deviceTable .group-action { border-left-color: #4bcf77 !important; }
+
+/* ---------- Audio archive ---------- */
+html[data-bs-theme] .sticky-actions {
+  background: var(--app-page-bg) !important;
+}
+
+html[data-bs-theme] .audio-card,
+html[data-bs-theme] .audio-folder-card {
+  background: var(--app-surface) !important;
+  color: var(--app-text) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] .audio-card:hover,
+html[data-bs-theme] .audio-folder-card:hover {
+  background: var(--app-hover-bg) !important;
+  border-color: var(--app-border-strong) !important;
+}
+
+html[data-bs-theme] .audio-card .audio-title,
+html[data-bs-theme] .audio-folder-title {
+  color: var(--app-text) !important;
+}
+
+html[data-bs-theme] .audio-card .audio-meta,
+html[data-bs-theme] .audio-folder-meta,
+html[data-bs-theme] .audio-breadcrumb,
+html[data-bs-theme] .audio-cascade-note {
+  color: var(--app-text-muted) !important;
+}
+
+html[data-bs-theme] .audio-folder-icon {
+  background: var(--app-surface-2) !important;
+  border-color: var(--app-border) !important;
+  color: var(--app-accent) !important;
+}
+
+html[data-bs-theme] .audio-breadcrumb a {
+  color: var(--app-accent) !important;
+}
+
+html[data-bs-theme] .audio-archive-pager,
+html[data-bs-theme] .audio-toolbar-line {
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] .viewer-img,
+html[data-bs-theme] .thumb {
+  background: var(--app-surface-2) !important;
+}
+
+html[data-bs-theme] audio {
+  color-scheme: light dark;
+}
+
+html[data-bs-theme="light"] .audio-wave span {
+  opacity: .74;
+}
+
+html[data-bs-theme="dark"] .audio-wave span {
+  opacity: .9;
+}
+
+/* ---------- Map Visual / MapLibre chrome ---------- */
+html[data-bs-theme] #map {
+  background: var(--app-surface-2);
+  border: 1px solid var(--app-border);
+  box-shadow: var(--app-shadow-strong);
+}
+
+html[data-bs-theme] .maplibregl-ctrl-group {
+  background: var(--app-surface) !important;
+  border: 1px solid var(--app-border) !important;
+  box-shadow: var(--app-shadow) !important;
+}
+
+html[data-bs-theme] .maplibregl-ctrl-group button {
+  background-color: var(--app-surface) !important;
+  border-color: var(--app-border) !important;
+}
+
+html[data-bs-theme] .maplibregl-ctrl-group button:hover,
+html[data-bs-theme] .maplibregl-ctrl-group button:focus {
+  background-color: var(--app-hover-bg) !important;
+}
+
+html[data-bs-theme="dark"] .maplibregl-ctrl-icon {
+  filter: invert(1) brightness(1.4);
+}
+
+html[data-bs-theme] .maplibregl-ctrl-attrib,
+html[data-bs-theme] .maplibregl-ctrl-attrib a {
+  background: var(--app-surface) !important;
+  color: var(--app-text-muted) !important;
+}
+
+html[data-bs-theme] .maplibregl-popup-content {
+  background: var(--app-surface) !important;
+  color: var(--app-text) !important;
+  border: 1px solid var(--app-border);
+  box-shadow: var(--app-shadow-strong);
+}
+
+html[data-bs-theme] .maplibregl-popup-close-button {
+  color: var(--app-text) !important;
+}
+
+html[data-bs-theme="light"] .maplibregl-popup-anchor-top .maplibregl-popup-tip { border-bottom-color: var(--app-surface); }
+html[data-bs-theme="light"] .maplibregl-popup-anchor-bottom .maplibregl-popup-tip { border-top-color: var(--app-surface); }
+html[data-bs-theme="light"] .maplibregl-popup-anchor-left .maplibregl-popup-tip { border-right-color: var(--app-surface); }
+html[data-bs-theme="light"] .maplibregl-popup-anchor-right .maplibregl-popup-tip { border-left-color: var(--app-surface); }
+html[data-bs-theme="dark"] .maplibregl-popup-anchor-top .maplibregl-popup-tip { border-bottom-color: var(--app-surface); }
+html[data-bs-theme="dark"] .maplibregl-popup-anchor-bottom .maplibregl-popup-tip { border-top-color: var(--app-surface); }
+html[data-bs-theme="dark"] .maplibregl-popup-anchor-left .maplibregl-popup-tip { border-right-color: var(--app-surface); }
+html[data-bs-theme="dark"] .maplibregl-popup-anchor-right .maplibregl-popup-tip { border-left-color: var(--app-surface); }
+
+html[data-bs-theme] .conn-glass {
+  box-shadow: var(--app-shadow);
+  backdrop-filter: blur(8px);
+}
+
+html[data-bs-theme="light"] .conn-glass:not(.local):not(.remote) {
+  background: rgba(255, 255, 255, .82) !important;
+  border-color: rgba(51, 65, 85, .22) !important;
+  color: #334155 !important;
+}
+
+html[data-bs-theme="dark"] .conn-glass:not(.local):not(.remote) {
+  background: rgba(27, 34, 41, .82) !important;
+  border-color: rgba(229, 231, 235, .20) !important;
+  color: #e5e7eb !important;
+}
+
+/* Semantic local/remote states stay green/red, only contrast is normalized. */
+html[data-bs-theme="light"] .conn-glass.local { color: #0f5132 !important; }
+html[data-bs-theme="light"] .conn-glass.remote { color: #842029 !important; }
+html[data-bs-theme="dark"] .conn-glass.local { color: #d1fae5 !important; }
+html[data-bs-theme="dark"] .conn-glass.remote { color: #ffe4e6 !important; }
+
+/* ---------- Responsive polish ---------- */
+@media (max-width: 767.98px) {
+  html[data-bs-theme] .modal-dialog {
+    margin: .75rem;
+  }
+
+  html[data-bs-theme] .audio-folder-card,
+  html[data-bs-theme] .audio-card {
+    border-radius: 10px;
+  }
+
+  html[data-bs-theme] #map {
+    border-radius: 8px;
+  }
+}
+
+/* Build marker: THEME-T5-VISUAL-POLISH-20260930 */
+
+/* ========================================================================
+ * T5.2 - Theme-aware top navigation
+ * Header, logo, text and theme control follow the active light/dark mode.
+ * ======================================================================== */
+html[data-bs-theme] header.navbar {
+  background: var(--app-header-bg) !important;
+  background-color: var(--app-header-bg) !important;
+  color: var(--app-header-text) !important;
+  border-bottom: 1px solid var(--app-border) !important;
+  backdrop-filter: blur(10px);
+}
+
+html[data-bs-theme] header.navbar .bi_logo {
+  display: inline-block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  fill: var(--app-header-text) !important;
+  color: var(--app-header-text) !important;
+}
+
+html[data-bs-theme] header.navbar .nav-link,
+html[data-bs-theme] header.navbar .navbar-brand,
+html[data-bs-theme] header.navbar .text-white {
+  color: var(--app-header-text) !important;
+}
+
+html[data-bs-theme] header.navbar .app-theme-toggle {
+  background: var(--app-theme-button-bg) !important;
+  color: var(--app-theme-button-text) !important;
+  border-color: var(--app-theme-button-border) !important;
+  box-shadow: var(--app-shadow);
+}
+
+html[data-bs-theme] header.navbar .app-theme-toggle:hover {
+  background: var(--app-theme-button-hover) !important;
+  border-color: var(--app-border-strong) !important;
+}
+
+/* Build marker: THEME-T5.2-DYNAMIC-TOPNAV-20260930 */
+
+/* ========================================================================
+ * T5.3 - Controller Clear Search button contrast fix
+ * Bootstrap's btn-outline-light becomes effectively invisible on the light
+ * controller surface.  Keep the existing markup/behavior and theme it here.
+ * ======================================================================== */
+html[data-bs-theme] #clearSearch {
+  background: transparent !important;
+  color: var(--app-text) !important;
+  border-color: var(--app-border-strong) !important;
+  box-shadow: none !important;
+}
+
+html[data-bs-theme] #clearSearch:hover,
+html[data-bs-theme] #clearSearch:focus,
+html[data-bs-theme] #clearSearch:active,
+html[data-bs-theme] #clearSearch.show {
+  background: var(--app-hover-bg) !important;
+  color: var(--app-text) !important;
+  border-color: var(--app-accent) !important;
+}
+
+html[data-bs-theme] #clearSearch:focus-visible {
+  outline: 3px solid var(--app-focus) !important;
+  outline-offset: 2px;
+}
+
+/* ========================================================================
+ * T5.5 - Audio Archive cascade-filter theme fix
+ * The forced Bootstrap dark utility classes were removed from showaudio.php.
+ * These selectors now provide explicit light/dark states while preserving
+ * Bootstrap's native select arrow/background-image behavior.
+ * ======================================================================== */
+:root[data-bs-theme="light"] #audioFilterForm .audio-cascade-filter {
+  background-color: #ffffff !important;
+  color: #1f2937 !important;
+  border-color: #d8e0e8 !important;
+  color-scheme: light;
+}
+
+:root[data-bs-theme="dark"] #audioFilterForm .audio-cascade-filter {
+  background-color: #222b33 !important;
+  color: #edf2f7 !important;
+  border-color: #3b4650 !important;
+  color-scheme: dark;
+}
+
+html[data-bs-theme] #audioFilterForm .audio-cascade-filter:not(:disabled):hover {
+  border-color: var(--app-border-strong) !important;
+}
+
+html[data-bs-theme] #audioFilterForm .audio-cascade-filter:focus {
+  border-color: var(--app-accent) !important;
+  box-shadow: 0 0 0 .2rem var(--app-focus) !important;
+}
+
+:root[data-bs-theme="light"] #audioFilterForm .audio-cascade-filter:disabled,
+:root[data-bs-theme="light"] #audioFilterForm .audio-cascade-filter[disabled] {
+  background-color: #f3f6f9 !important;
+  color: #667085 !important;
+  border-color: #d8e0e8 !important;
+  opacity: 1 !important;
+}
+
+:root[data-bs-theme="dark"] #audioFilterForm .audio-cascade-filter:disabled,
+:root[data-bs-theme="dark"] #audioFilterForm .audio-cascade-filter[disabled] {
+  background-color: #1b2229 !important;
+  color: #a8b4bf !important;
+  border-color: #3b4650 !important;
+  opacity: 1 !important;
+}
+
+:root[data-bs-theme="light"] #audioFilterForm .audio-cascade-filter option {
+  background-color: #ffffff;
+  color: #1f2937;
+}
+
+:root[data-bs-theme="dark"] #audioFilterForm .audio-cascade-filter option {
+  background-color: #222b33;
+  color: #edf2f7;
+}
+
+/* Build marker: THEME-T5.5-SHOWAUDIO-FILTER-SOURCE-FIX-20260930 */

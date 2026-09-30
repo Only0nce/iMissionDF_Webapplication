@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <script src="assets/theme/app-theme.js"></script>
   <meta charset="UTF-8">
   <title>iScan WebRX Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,12 +9,13 @@
   <script src="dashboard.js"></script>
   <link href="css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body { background-color: #121212; color: #fff; }
-    canvas { background: #1e1e1e; border: 1px solid #444; margin-bottom: 20px; width: 100%; }
-    #smeter-bar { width: 100%; height: 25px; background: #333; border: 1px solid #666; }
+    body { background-color: var(--app-page-bg); color: var(--app-text); }
+    canvas { background: var(--app-canvas-bg); border: 1px solid var(--app-canvas-border); margin-bottom: 20px; width: 100%; }
+    #smeter-bar { width: 100%; height: 25px; background: var(--app-meter-bg); border: 1px solid var(--app-border-strong); }
     #smeter-fill { height: 100%; width: 0%; background: lime; }
     .section { margin-bottom: 2rem; }
   </style>
+  <link href="assets/theme/app-theme.css" rel="stylesheet">
 </head>
 <body class="p-4">
   <div class="container">

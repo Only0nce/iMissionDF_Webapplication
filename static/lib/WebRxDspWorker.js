@@ -70,10 +70,13 @@ function projectWaterfall(message) {
     return Number.isFinite(peak) ? peak : fallbackDb;
   }
 
-  for (let logicalRow = 0; logicalRow < rowsWritten; logicalRow++) {
+  const projectionRowsWritten = Math.min(rowsWritten, height);
+  for (let logicalRow = 0; logicalRow < projectionRowsWritten; logicalRow++) {
     const physicalRow = (headRow + logicalRow) % capacityRows;
     const rowOffset = physicalRow * sourceBins;
-    let dst = physicalRow * width * 4;
+    // Projection rows are viewport-local. They must not reuse source-ring
+    // physical indices because source capacity may exceed viewport height.
+    let dst = logicalRow * width * 4;
 
     for (let x = 0; x < width; x++, dst += 4) {
       const rawDb = sourceValue(rowOffset, x);
@@ -102,6 +105,7 @@ function projectWaterfall(message) {
     capacityRows,
     headRow,
     rowsWritten,
+    projectionRowsWritten,
     elapsedMs: nowMs() - startMs,
     rgba: rgba.buffer
   };

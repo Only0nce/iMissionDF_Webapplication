@@ -265,7 +265,7 @@ if (!$baseReal) {
 <!doctype html>
 <html lang="en" data-bs-theme="auto">
 <head>
-  <script src="assets/js/color-modes.js"></script>
+  <script src="assets/theme/app-theme.js"></script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>IFZ: DFlog Viewer</title>
@@ -283,6 +283,7 @@ if (!$baseReal) {
     .log-card { border-radius: 16px; overflow: hidden; }
     .table-wrap { overflow:auto; max-height: 70vh; border-radius: 12px; border: 1px solid rgba(125,125,125,0.25); }
   </style>
+  <link href="assets/theme/app-theme.css" rel="stylesheet">
 </head>
 
 <header class="navbar sticky-top flex-md-nowrap p-0 shadow" style="background-color:#000000DD;">

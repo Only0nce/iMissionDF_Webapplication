@@ -998,7 +998,7 @@ $hourBuckets = build_audio_hour_buckets($filtered);
 <!doctype html>
 <html lang="en" data-bs-theme="auto">
 <head>
-  <script src="assets/js/color-modes.js"></script>
+  <script src="assets/theme/app-theme.js"></script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>IFZ: Audio Archive</title>
@@ -1351,6 +1351,7 @@ main {
 }
 </style>
 
+  <link href="assets/theme/app-theme.css" rel="stylesheet">
 </head>
 
 <header class="navbar sticky-top flex-md-nowrap p-0 shadow" style="background-color:#000000DD;">
@@ -1506,7 +1507,7 @@ main {
           <div class="row g-2 align-items-end">
             <div class="col-md-2">
               <label class="form-label fw-semibold">Year</label>
-              <select class="form-select form-select-sm bg-dark text-light border-secondary audio-cascade-filter" name="year" data-level="year">
+              <select class="form-select form-select-sm audio-cascade-filter" name="year" data-level="year">
                 <option value="">Select year</option>
                 <?php foreach ($yearOptions as $opt): ?>
                   <option value="<?php echo h($opt['key']); ?>" <?php echo $year === $opt['key'] ? 'selected' : ''; ?>>
@@ -1518,7 +1519,7 @@ main {
 
             <div class="col-md-3">
               <label class="form-label fw-semibold">Month</label>
-              <select class="form-select form-select-sm bg-dark text-light border-secondary audio-cascade-filter" name="month" data-level="month" <?php echo $year === '' ? 'disabled' : ''; ?>>
+              <select class="form-select form-select-sm audio-cascade-filter" name="month" data-level="month" <?php echo $year === '' ? 'disabled' : ''; ?>>
                 <option value="">Select month</option>
                 <?php foreach ($monthOptions as $opt): ?>
                   <option value="<?php echo h($opt['key']); ?>" <?php echo $month === $opt['key'] ? 'selected' : ''; ?>>
@@ -1530,7 +1531,7 @@ main {
 
             <div class="col-md-3">
               <label class="form-label fw-semibold">Day</label>
-              <select class="form-select form-select-sm bg-dark text-light border-secondary audio-cascade-filter" name="date" data-level="date" <?php echo $month === '' ? 'disabled' : ''; ?>>
+              <select class="form-select form-select-sm audio-cascade-filter" name="date" data-level="date" <?php echo $month === '' ? 'disabled' : ''; ?>>
                 <option value="">Select day</option>
                 <?php foreach ($dayOptions as $opt): ?>
                   <option value="<?php echo h($opt['key']); ?>" <?php echo $date === $opt['key'] ? 'selected' : ''; ?>>
@@ -1542,7 +1543,7 @@ main {
 
             <div class="col-md-2">
               <label class="form-label fw-semibold">Time</label>
-              <select class="form-select form-select-sm bg-dark text-light border-secondary audio-cascade-filter" name="hour" data-level="hour" <?php echo $date === '' ? 'disabled' : ''; ?>>
+              <select class="form-select form-select-sm audio-cascade-filter" name="hour" data-level="hour" <?php echo $date === '' ? 'disabled' : ''; ?>>
                 <option value="">Select time</option>
                 <?php foreach ($hourOptions as $opt): ?>
                   <option value="<?php echo h($opt['key']); ?>" <?php echo $hour === $opt['key'] ? 'selected' : ''; ?>>
@@ -1554,7 +1555,7 @@ main {
 
             <div class="col-md-1">
               <label class="form-label fw-semibold">Show</label>
-              <select class="form-select form-select-sm bg-dark text-light border-secondary audio-cascade-filter" name="per_page" data-level="per_page">
+              <select class="form-select form-select-sm audio-cascade-filter" name="per_page" data-level="per_page">
                 <?php foreach ($perPageOptions as $opt): ?>
                   <option value="<?php echo (int)$opt; ?>" <?php echo $perPage === $opt ? 'selected' : ''; ?>>
                     <?php echo (int)$opt; ?>

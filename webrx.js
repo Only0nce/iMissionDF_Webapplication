@@ -116,6 +116,57 @@ const FrequencyViewTransform = (() => {
     return ReceiverState.centerHz + ReceiverState.sampleRateHz / 2;
   }
 
+  function getAcquisitionSnapshot() {
+    const startHz = acquisitionStartHz();
+    const endHz = acquisitionEndHz();
+    return {
+      centerHz: ReceiverState.centerHz,
+      startHz,
+      endHz,
+      spanHz: Math.max(1, ReceiverState.sampleRateHz),
+      sampleRateHz: ReceiverState.sampleRateHz,
+      fftSize: ReceiverState.fftSize,
+      epoch: ReceiverState.acquisitionEpoch
+    };
+  }
+
+  function frequencyToNormalized(frequencyHz) {
+    const acquisition = getAcquisitionSnapshot();
+    return (Number(frequencyHz) - acquisition.startHz) / acquisition.spanHz;
+  }
+
+  function normalizedToFrequency(normalized) {
+    const acquisition = getAcquisitionSnapshot();
+    return acquisition.startHz + Number(normalized) * acquisition.spanHz;
+  }
+
+  // FFT bins represent uniformly spaced samples across the acquisition axis.
+  // Keep this mapping in one place so spectrum, waterfall and diagnostics cannot
+  // silently drift apart as the viewport implementation evolves.
+  function frequencyToBin(frequencyHz, sourceBins, options = {}) {
+    const bins = Math.max(0, Math.floor(Number(sourceBins) || 0));
+    if (bins <= 0) return options.clamp === false ? NaN : 0;
+    const raw = frequencyToNormalized(frequencyHz) * bins;
+    if (options.clamp === false) return raw;
+    return clamp(raw, 0, bins);
+  }
+
+  function binToFrequency(bin, sourceBins, options = {}) {
+    const bins = Math.max(0, Math.floor(Number(sourceBins) || 0));
+    if (bins <= 0) return NaN;
+    let value = Number(bin);
+    if (!Number.isFinite(value)) return NaN;
+    if (options.clamp !== false) value = clamp(value, 0, bins);
+    return normalizedToFrequency(value / bins);
+  }
+
+  function isFrequencyInAcquisition(frequencyHz) {
+    const f = Number(frequencyHz);
+    if (!Number.isFinite(f)) return false;
+    const acquisition = getAcquisitionSnapshot();
+    return f >= acquisition.startHz && f <= acquisition.endHz;
+  }
+
   function effectiveZoom() {
     const z = Number(zoomLevel);
     return Math.max(1, Number.isFinite(z) ? z : 1);
@@ -180,19 +231,17 @@ const FrequencyViewTransform = (() => {
     const bins = Math.max(0, Math.floor(Number(sourceBins) || 0));
     if (bins <= 0) return { start: 0, end: 0, count: 0 };
     const view = getViewSnapshot();
-    const startNorm = clamp(
-      (view.viewStartHz - view.acquisitionStartHz) / view.acquisitionSpanHz,
-      0,
-      1
-    );
-    const endNorm = clamp(
-      (view.viewEndHz - view.acquisitionStartHz) / view.acquisitionSpanHz,
-      0,
-      1
-    );
-    const start = Math.max(0, Math.min(bins - 1, Math.floor(startNorm * bins)));
-    const end = Math.max(start + 1, Math.min(bins, Math.ceil(endNorm * bins)));
-    return { start, end, count: Math.max(0, end - start) };
+    const startFloat = frequencyToBin(view.viewStartHz, bins);
+    const endFloat = frequencyToBin(view.viewEndHz, bins);
+    const start = Math.max(0, Math.min(bins - 1, Math.floor(startFloat)));
+    const end = Math.max(start + 1, Math.min(bins, Math.ceil(endFloat)));
+    return {
+      start,
+      end,
+      count: Math.max(0, end - start),
+      startHz: binToFrequency(start, bins),
+      endHz: binToFrequency(end, bins)
+    };
   }
 
   function scrollToCenterHz(centerHz) {
@@ -216,6 +265,12 @@ const FrequencyViewTransform = (() => {
   return {
     acquisitionStartHz,
     acquisitionEndHz,
+    getAcquisitionSnapshot,
+    frequencyToNormalized,
+    normalizedToFrequency,
+    frequencyToBin,
+    binToFrequency,
+    isFrequencyInAcquisition,
     frequencyToCanvasX,
     canvasXToFrequency,
     hzPerCanvasPixel,
@@ -260,7 +315,10 @@ const WebRxDiagnostics = (() => {
     tuningFlushes: 0,
     tuningAcks: 0,
     tuningStaleSuppressed: 0,
+    tuningDuplicateSuppressed: 0,
     tuneSendFailures: 0,
+    viewMutations: 0,
+    viewTuneViolations: 0,
     audioPackets: 0,
     audioHdPackets: 0,
     audioInputBytes: 0,
@@ -368,6 +426,9 @@ const WebRxDiagnostics = (() => {
   function markTuningFlush() { counters.tuningFlushes++; }
   function markTuningAck() { counters.tuningAcks++; }
   function markTuningStaleSuppressed() { counters.tuningStaleSuppressed++; }
+  function markTuningDuplicateSuppressed() { counters.tuningDuplicateSuppressed++; }
+  function markViewMutation() { counters.viewMutations++; }
+  function markViewTuneViolation() { counters.viewTuneViolations++; }
   function markTuneSendFailure() { counters.tuneSendFailures++; }
   function markAudioPacket(isHd, bytes) {
     counters.audioPackets++;
@@ -471,6 +532,9 @@ const WebRxDiagnostics = (() => {
       tuningFlushes: counters.tuningFlushes,
       tuningAcks: counters.tuningAcks,
       tuningStaleSuppressed: counters.tuningStaleSuppressed,
+      tuningDuplicateSuppressed: counters.tuningDuplicateSuppressed,
+      viewMutations: counters.viewMutations,
+      viewTuneViolations: counters.viewTuneViolations,
       tuneSendFailures: counters.tuneSendFailures,
       audioPackets: counters.audioPackets,
       audioHdPackets: counters.audioHdPackets,
@@ -582,6 +646,9 @@ const WebRxDiagnostics = (() => {
     markTuningFlush,
     markTuningAck,
     markTuningStaleSuppressed,
+    markTuningDuplicateSuppressed,
+    markViewMutation,
+    markViewTuneViolation,
     markTuneSendFailure,
     markAudioPacket,
     markAudioResumeRequest,
@@ -1805,6 +1872,33 @@ window.setRealtimeDspWorkerEnabled = (enabled) => RealtimeDspWorker.setEnabled(e
 // config frames while the server is acknowledging a command. This is NOT a
 // second source of truth: the guard expires quickly and server state becomes
 // authoritative again if the requested value is not acknowledged.
+const ViewCommandIsolation = (() => {
+  let depth = 0;
+  let currentReason = "";
+
+  function run(reason, callback) {
+    const previousReason = currentReason;
+    depth++;
+    currentReason = reason || previousReason || "view";
+    WebRxDiagnostics.markViewMutation();
+    try {
+      return callback();
+    } finally {
+      depth = Math.max(0, depth - 1);
+      currentReason = depth > 0 ? previousReason : "";
+    }
+  }
+
+  function noteTuneAttempt(type) {
+    if (depth <= 0) return;
+    WebRxDiagnostics.markViewTuneViolation();
+    console.error(`[VIEW-ISOLATION] RF command ${type} attempted during view-only mutation: ${currentReason}`);
+  }
+
+  return { run, noteTuneAttempt, isActive: () => depth > 0, reason: () => currentReason };
+})();
+window.ViewCommandIsolation = ViewCommandIsolation;
+
 const TuningStateGuard = (() => {
   const ACK_TOLERANCE_HZ = 2;
   const HOLD_MS = 1200;
@@ -2039,6 +2133,7 @@ const FrequencyController = (() => {
   }
 
   function sendOffsetNow(offsetHz, reason, intentGeneration) {
+    ViewCommandIsolation.noteTuneAttempt("offset_freq");
     const sent = sendMessageToServer({
       type: "dspcontrol",
       params: { offset_freq: Math.round(offsetHz) }
@@ -2055,6 +2150,7 @@ const FrequencyController = (() => {
   }
 
   function sendCenterNow(centerHz, reason, intentGeneration) {
+    ViewCommandIsolation.noteTuneAttempt("setfrequency");
     cancelPendingOffset();
     const sent = sendMessageToServer({
       type: "setfrequency",
@@ -2132,6 +2228,15 @@ const FrequencyController = (() => {
     const halfSpan = sampleRateHz / 2;
     const offsetHz = Math.max(-halfSpan, Math.min(halfSpan, Number(requestedOffsetHz)));
     if (!Number.isFinite(offsetHz)) return false;
+
+    // Avoid retransmitting an RF command when the quantized receiver offset is
+    // already at the requested value. This is especially useful for dense drag
+    // events where multiple mouse positions collapse to the same tuning step.
+    if (Math.round(offsetHz) === Math.round(ReceiverState.offsetHz)) {
+      WebRxDiagnostics.markTuningDuplicateSuppressed();
+      refreshVisuals();
+      return true;
+    }
 
     const intentGeneration = TuningStateGuard.noteIntent(
       "offset", ReceiverState.centerHz, offsetHz, reason
@@ -2480,6 +2585,87 @@ ws.onmessage = (evt) => {
   }
 };
 
+// === ASTRARX WEBSOCKET RECOVERY (Production integration) ===
+// Preserve the existing protocol handlers while adding bounded reconnect with
+// exponential backoff. A reconnect never emits tuning commands; server config
+// remains authoritative when the new session comes up.
+const AstraRxConnectionRecovery = (() => {
+  const MIN_DELAY_MS = 1000;
+  const MAX_DELAY_MS = 10000;
+  let attempts = 0;
+  let reconnectTimer = null;
+  let unloading = false;
+  let lastCloseCode = 0;
+  let lastErrorAt = 0;
+  const openHandler = ws.onopen;
+  const messageHandler = ws.onmessage;
+
+  function delayForAttempt() {
+    return Math.min(MAX_DELAY_MS, MIN_DELAY_MS * Math.pow(2, Math.min(4, attempts)));
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function attach(socket) {
+    socket.binaryType = "arraybuffer";
+    socket.onmessage = messageHandler;
+    socket.onopen = (event) => {
+      attempts = 0;
+      clearReconnectTimer();
+      return openHandler.call(socket, event);
+    };
+    socket.onerror = () => { lastErrorAt = Date.now(); };
+    socket.onclose = (event) => {
+      lastCloseCode = Number(event && event.code) || 0;
+      if (unloading) return;
+      scheduleReconnect();
+    };
+  }
+
+  function scheduleReconnect() {
+    if (unloading || reconnectTimer !== null) return;
+    const delay = delayForAttempt();
+    attempts++;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (unloading) return;
+      try {
+        const next = new WebSocket(resolveAstraRxWsUrl());
+        ws = next;
+        attach(next);
+      } catch (error) {
+        lastErrorAt = Date.now();
+        scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  window.addEventListener('beforeunload', () => {
+    unloading = true;
+    clearReconnectTimer();
+  });
+
+  // Replace the initial socket handlers with recovery-aware wrappers.
+  attach(ws);
+
+  return {
+    reconnectNow: () => { clearReconnectTimer(); scheduleReconnect(); },
+    snapshot: () => ({
+      attempts,
+      timerPending: reconnectTimer !== null,
+      lastCloseCode,
+      lastErrorAt,
+      readyState: ws ? ws.readyState : -1
+    })
+  };
+})();
+window.AstraRxConnectionRecovery = AstraRxConnectionRecovery;
+
 // === SEND GENERIC MESSAGE ===
 function sendMessageToServer(message) {
   if (typeof ws !== 'undefined' && ws.readyState === WebSocket.OPEN) {
@@ -2495,15 +2681,11 @@ const getStoredTheme = () => localStorage.getItem('theme')
 
 const getPreferredTheme = () => {
   const storedTheme = getStoredTheme()
-  if (storedTheme) {
+  if (storedTheme === 'light' || storedTheme === 'dark') {
     return storedTheme
   }
-  if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-
-  }
-  else
-    console.log("prefers-color-scheme: light");
-
+  // Legacy pages may have stored "auto". Resolve it here instead of
+  // treating it as light inside setTheme().
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
 
@@ -2529,6 +2711,15 @@ function setTheme(mode) {
   // Theme changes must not advance waterfall history with a duplicate RF row.
   drawSMeter(currentSMeterValue);
 }
+
+// Shared page-theme engine notifies WebRX immediately.  This updates only
+// presentation colors; it does not retune, send DSP commands, or append a
+// duplicate waterfall row.
+window.addEventListener('app-theme-change', (event) => {
+  const resolved = event && event.detail && event.detail.resolvedTheme;
+  mode = resolved === 'dark' ? 'dark' : 'light';
+  setTheme(mode);
+});
 
 let latestFFT = new Float32Array(0);
 let spectrumSourceRevision = 0;
@@ -2636,8 +2827,8 @@ function drawScale() {
   const startFreq = view.viewStartHz;
   const endFreq = view.viewEndHz;
   for (let i = 0; i <= freqSteps; i++) {
-    const x = (i / freqSteps) * width;
     const freq = startFreq + (endFreq - startFreq) * (i / freqSteps);
+    const x = FrequencyViewTransform.frequencyToCanvasX(freq, width);
     ctx.beginPath();
     ctx.moveTo(x, 0);
     ctx.lineTo(x, height);
@@ -2737,7 +2928,8 @@ function getSpectrumStaticLayer(width, height) {
 
   const freqSteps = 10;
   for (let i = 0; i <= freqSteps; i++) {
-    const x = (i / freqSteps) * width;
+    const freq = view.viewStartHz + view.viewSpanHz * (i / freqSteps);
+    const x = FrequencyViewTransform.frequencyToCanvasX(freq, width);
     ctx.beginPath();
     ctx.moveTo(x, 0);
     ctx.lineTo(x, height);
@@ -3370,6 +3562,10 @@ const WaterfallEngine = (() => {
   let projectedHeight = 0;
   let rowBytes = 0;
   let rgbaHistory = null;
+  // Presentation ring is intentionally independent from sourceHistory.
+  // Source history may retain more rows than the current viewport height.
+  let projectionHeadRow = 0;      // newest projected row
+  let projectionRowsWritten = 0;  // valid projected rows
   let projectionDirty = true;
   let projectionReason = "bootstrap";
   let framePending = false;
@@ -3456,6 +3652,8 @@ const WaterfallEngine = (() => {
     if (changed) {
       rgbaHistory = new Uint8ClampedArray(requiredBytes);
       if (clearNew) opaqueBlack(rgbaHistory);
+      projectionHeadRow = 0;
+      projectionRowsWritten = 0;
     }
     projectedWidth = geometry.width;
     projectedHeight = geometry.height;
@@ -3529,7 +3727,11 @@ const WaterfallEngine = (() => {
       markProjectionDirty("canvas-width");
     }
 
-    if (capacityRows > 0 && capacityRows !== displayHeight && sourceHistory && sourceBins > 0) {
+    // RF history capacity is not presentation geometry. Grow when a taller
+    // viewport needs more history, but never shrink on resize; shrinking would
+    // permanently discard older RF rows and violate persistent-waterfall
+    // semantics when the user restores the window size later.
+    if (capacityRows > 0 && displayHeight > capacityRows && sourceHistory && sourceBins > 0) {
       resizeHistoryCapacity(displayHeight);
     } else if (capacityRows === 0) {
       capacityRows = displayHeight;
@@ -3597,7 +3799,7 @@ const WaterfallEngine = (() => {
     const key = currentAcquisitionKey(bins);
     if (!sourceHistory || sourceBins !== bins || acquisitionKey !== key) {
       allocateSourceHistory(bins, geometry.height, true);
-    } else if (capacityRows !== geometry.height) {
+    } else if (geometry.height > capacityRows) {
       resizeHistoryCapacity(geometry.height);
     }
     return true;
@@ -3731,15 +3933,24 @@ const WaterfallEngine = (() => {
     rgbaHistory[dst + 3] = 255;
   }
 
-  function projectPhysicalRow(physicalRow, visibleRange) {
-    if (!rgbaHistory || projectedWidth <= 0 || physicalRow < 0 || physicalRow >= capacityRows) return;
-    const rowOffset = physicalRow * rowBytes;
+  function projectPhysicalRow(physicalRow, visibleRange, projectionRow = physicalRow) {
+    if (!rgbaHistory || projectedWidth <= 0 || projectedHeight <= 0) return;
+    if (physicalRow < 0 || physicalRow >= capacityRows) return;
+    if (projectionRow < 0 || projectionRow >= projectedHeight) return;
+    const rowOffset = projectionRow * rowBytes;
     for (let x = 0; x < projectedWidth; x++) {
       writeColor(
         rowOffset + x * 4,
         sourceValueForPixel(physicalRow, x, projectedWidth, visibleRange)
       );
     }
+  }
+
+  function prependProjectedPhysicalRow(physicalRow, visibleRange) {
+    if (!rgbaHistory || projectedHeight <= 0) return;
+    projectionHeadRow = (projectionHeadRow - 1 + projectedHeight) % projectedHeight;
+    projectPhysicalRow(physicalRow, visibleRange, projectionHeadRow);
+    projectionRowsWritten = Math.min(projectedHeight, projectionRowsWritten + 1);
   }
 
   function handleWorkerMessage(event) {
@@ -3805,18 +4016,25 @@ const WaterfallEngine = (() => {
 
     rgbaHistory = result;
     rowBytes = projectedWidth * 4;
+    projectionHeadRow = 0;
+    projectionRowsWritten = Math.min(
+      projectedHeight,
+      Number.isFinite(Number(message.projectionRowsWritten))
+        ? Number(message.projectionRowsWritten)
+        : Math.min(rowsWritten, projectedHeight)
+    );
     projectionDirty = false;
     projectionReason = "";
 
     // Source FFT rows may continue arriving while the worker operates. Catch up
-    // only those newest physical rows on the main thread instead of discarding
-    // an otherwise valid full-history projection.
+    // only those newest rows. Replay oldest->newest so the presentation ring
+    // ends with the true newest row at its head.
     if (sourceDelta > 0 && sourceHistory) {
       ensureColorMapping();
       const visibleRange = FrequencyViewTransform.visibleBinRange(sourceBins);
-      for (let i = 0; i < sourceDelta; i++) {
+      for (let i = sourceDelta - 1; i >= 0; i--) {
         const physicalRow = (headRow + i) % capacityRows;
-        projectPhysicalRow(physicalRow, visibleRange);
+        prependProjectedPhysicalRow(physicalRow, visibleRange);
       }
     }
 
@@ -3897,12 +4115,16 @@ const WaterfallEngine = (() => {
     }
 
     if (!changedGeometry) opaqueBlack(rgbaHistory);
+    projectionHeadRow = 0;
+    projectionRowsWritten = 0;
     if (sourceHistory && rowsWritten > 0) {
       const visibleRange = FrequencyViewTransform.visibleBinRange(sourceBins);
-      for (let logicalRow = 0; logicalRow < rowsWritten; logicalRow++) {
+      const rowsToProject = Math.min(rowsWritten, projectedHeight);
+      for (let logicalRow = 0; logicalRow < rowsToProject; logicalRow++) {
         const physicalRow = (headRow + logicalRow) % capacityRows;
-        projectPhysicalRow(physicalRow, visibleRange);
+        projectPhysicalRow(physicalRow, visibleRange, logicalRow);
       }
+      projectionRowsWritten = rowsToProject;
     }
 
     projectionDirty = false;
@@ -3925,8 +4147,13 @@ const WaterfallEngine = (() => {
     // Refresh the cheap dB/color lookup immediately so the newest row follows
     // the current auto range. Rebuild older history at a bounded cadence only.
     ensureColorMapping();
-    if (!projectionDirty && rgbaHistory && sourceHistory && rowsWritten > 0) {
-      projectPhysicalRow(headRow, FrequencyViewTransform.visibleBinRange(sourceBins));
+    if (!projectionDirty && rgbaHistory && sourceHistory && rowsWritten > 0 &&
+        projectionRowsWritten > 0) {
+      projectPhysicalRow(
+        headRow,
+        FrequencyViewTransform.visibleBinRange(sourceBins),
+        projectionHeadRow
+      );
     }
     const now = webRxNowMs();
     if (intensity.reprojectSuggested &&
@@ -3959,10 +4186,14 @@ const WaterfallEngine = (() => {
     rowsWritten = Math.min(capacityRows, rowsWritten + 1);
     sourceRevision++;
 
-    // If the current projection is valid, update only the newest physical row.
-    // A zoom/resize/range change marks it dirty and triggers one full rebuild.
-    if (ensureProjection() && !projectionDirty) {
-      projectPhysicalRow(headRow, visibleRange);
+    // If a view/geometry/intensity change already invalidated the projection,
+    // rebuild once from authoritative sourceHistory; that rebuild already
+    // contains this newest FFT row. Otherwise prepend exactly one new row.
+    // This avoids duplicating the newest time row after Zoom/Pan/Resize.
+    if (projectionDirty) {
+      ensureProjection();
+    } else if (ensureProjection()) {
+      prependProjectedPhysicalRow(headRow, visibleRange);
     }
 
     WebRxDiagnostics.markWaterfallRow(webRxNowMs() - startMs);
@@ -3974,16 +4205,16 @@ const WaterfallEngine = (() => {
     if (!waterfallEnabled || !ensureProjection() || !ctx || !rgbaHistory) return;
 
     const startMs = webRxNowMs();
-    const firstRows = capacityRows - headRow;
+    const firstRows = projectedHeight - projectionHeadRow;
     if (firstRows > 0) {
-      const firstOffset = headRow * rowBytes;
+      const firstOffset = projectionHeadRow * rowBytes;
       const firstLength = firstRows * rowBytes;
       const firstView = rgbaHistory.subarray(firstOffset, firstOffset + firstLength);
       ctx.putImageData(new ImageData(firstView, projectedWidth, firstRows), 0, 0);
     }
 
-    if (headRow > 0) {
-      const secondRows = headRow;
+    if (projectionHeadRow > 0) {
+      const secondRows = projectionHeadRow;
       const secondLength = secondRows * rowBytes;
       const secondView = rgbaHistory.subarray(0, secondLength);
       ctx.putImageData(new ImageData(secondView, projectedWidth, secondRows), 0, firstRows);
@@ -4026,6 +4257,8 @@ const WaterfallEngine = (() => {
     headRow = 0;
     rowsWritten = 0;
     rgbaHistory = null;
+    projectionHeadRow = 0;
+    projectionRowsWritten = 0;
     sourceRevision++;
     markProjectionDirty("acquisition-change");
     colorRangeMinDb = NaN;
@@ -4047,6 +4280,8 @@ const WaterfallEngine = (() => {
     if (rgbaHistory) opaqueBlack(rgbaHistory);
     headRow = 0;
     rowsWritten = 0;
+    projectionHeadRow = 0;
+    projectionRowsWritten = 0;
     sourceRevision++;
     markProjectionDirty("clear");
     // The black cache already represents the cleared source state. Keep it
@@ -4079,6 +4314,8 @@ const WaterfallEngine = (() => {
       acquisitionEpoch: ReceiverState.acquisitionEpoch,
       projectedWidth,
       projectedHeight,
+      projectionHeadRow,
+      projectionRowsWritten,
       sourceBytes: sourceHistory ? sourceHistory.byteLength : 0,
       projectionBytes: rgbaHistory ? rgbaHistory.byteLength : 0,
       projectionDirty,
@@ -6247,6 +6484,10 @@ function scheduleViewportRefresh(reason = "view") {
 // viewport at every zoom level. A zero-height virtual sizer keeps the existing
 // native horizontal scrollbar/pan UX while rendering only the visible RF span.
 function updateCanvasZoom(options = {}) {
+  return ViewCommandIsolation.run(options.reason || "zoom", () => updateCanvasZoomInternal(options));
+}
+
+function updateCanvasZoomInternal(options = {}) {
   const spectrumCanvas = document.getElementById('spectrum-plot');
   const waterfallCanvas = document.getElementById('waterfall');
   const waterfallScaleCanvas = document.getElementById('waterfall-scale');
@@ -6289,9 +6530,11 @@ function updateCanvasZoom(options = {}) {
 
 function setViewCenterHz(centerHz) {
   if (!Number.isFinite(Number(centerHz))) return false;
-  const ok = FrequencyViewTransform.scrollToCenterHz(Number(centerHz));
-  if (ok) scheduleViewportRefresh("view-center");
-  return ok;
+  return ViewCommandIsolation.run("view-center", () => {
+    const ok = FrequencyViewTransform.scrollToCenterHz(Number(centerHz));
+    if (ok) scheduleViewportRefresh("view-center");
+    return ok;
+  });
 }
 window.setViewCenterHz = setViewCenterHz;
 window.panViewByHz = function(deltaHz) {

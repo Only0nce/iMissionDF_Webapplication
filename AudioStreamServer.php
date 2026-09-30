@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <script src="assets/theme/app-theme.js"></script>
     <meta charset="UTF-8">
     <title>Live Audio Stream</title>
     <style>
@@ -15,6 +16,7 @@
             font-size: 16px;
         }
     </style>
+  <link href="assets/theme/app-theme.css" rel="stylesheet">
 </head>
 <body>
     <h2>Live Audio Stream (Low Latency via AudioWorklet)</h2>

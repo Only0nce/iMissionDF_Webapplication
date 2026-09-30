@@ -225,7 +225,7 @@ if ($baseReal2 && strpos($baseReal2, "/var/www/html/") === 0) {
 <!doctype html>
 <html lang="en" data-bs-theme="auto">
 <head>
-  <script src="assets/js/color-modes.js"></script>
+  <script src="assets/theme/app-theme.js"></script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>IFZ: Picture Viewer</title>
@@ -243,6 +243,7 @@ if ($baseReal2 && strpos($baseReal2, "/var/www/html/") === 0) {
     .thumb { width: 100%; height: 190px; object-fit: cover; background: rgba(255,255,255,0.04); }
     .viewer-img { width: 100%; max-height: 70vh; object-fit: contain; background: rgba(0,0,0,0.06); border-radius: 12px; }
   </style>
+  <link href="assets/theme/app-theme.css" rel="stylesheet">
 </head>
 
 <header class="navbar sticky-top flex-md-nowrap p-0 shadow" style="background-color:#000000DD;">

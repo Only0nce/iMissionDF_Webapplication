@@ -14,6 +14,7 @@ $result = $conn->query($sql);
 <!DOCTYPE html>
 <html>
 <head>
+  <script src="assets/theme/app-theme.js"></script>
     <title>Event Logger</title>
     <style>
         table {
@@ -32,6 +33,7 @@ $result = $conn->query($sql);
             color: white;
         }
     </style>
+  <link href="assets/theme/app-theme.css" rel="stylesheet">
 </head>
 <body>
 

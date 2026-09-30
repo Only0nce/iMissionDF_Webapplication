@@ -82,6 +82,11 @@ class OpenWebRxLowLatencyAudioProcessor extends AudioWorkletProcessor {
     this.targetQueueMs = this._finite(msg.targetQueueMs, this.targetQueueMs);
     this.startQueueMs = this._finite(msg.startQueueMs, this.startQueueMs);
     this.hardMaxQueueMs = this._finite(msg.hardMaxQueueMs, this.hardMaxQueueMs);
+    // Maintain a real bounded-queue safety margin even if a console/API caller
+    // provides contradictory values. This mirrors AudioEngine's main-thread
+    // validation and keeps the worklet safe when configured independently.
+    const minimumHardMaxMs = Math.max(this.targetQueueMs, this.startQueueMs) + 20;
+    this.hardMaxQueueMs = Math.max(this.hardMaxQueueMs, minimumHardMaxMs);
     this.targetSamples = this._msToSamples(this.targetQueueMs);
     this.startSamples = this._msToSamples(this.startQueueMs);
     this.hardMaxSamples = this._msToSamples(this.hardMaxQueueMs);
